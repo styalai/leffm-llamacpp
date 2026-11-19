@@ -1533,7 +1533,8 @@ void llama_model::get_cascade_repack(int il, struct ggml_tensor ** w_t, struct g
                 break;
             }
             total += (size_t) hparams.n_embd * hparams.n_ff(i);                    // int8
-            total += (size_t) hparams.n_embd * hparams.n_ff(i) / 32 * sizeof(float); // scales
+            total += (size_t) hparams.n_embd * hparams.n_ff(i) / 32 *
+                     (with_up ? sizeof(ggml_fp16_t) : sizeof(float));               // scales
             if (with_up) {
                 total += (size_t) hparams.n_embd * hparams.n_ff(i);                        // up, int8
                 total += (size_t) hparams.n_ff(i) * (size_t) hparams.n_embd / 32 * sizeof(float); // up scales
@@ -1552,9 +1553,17 @@ void llama_model::get_cascade_repack(int il, struct ggml_tensor ** w_t, struct g
         cascade_wu.assign(n_layer, nullptr);
         cascade_wus.assign(n_layer, nullptr);
         for (int i = 0; i < n_layer; ++i) {
-            cascade_wt[i] = ggml_new_tensor_1d(ctx, GGML_TYPE_I8,  (int64_t) hparams.n_embd * hparams.n_ff(i));
-            cascade_st[i] = ggml_new_tensor_1d(ctx, GGML_TYPE_F32,
-                                               (int64_t) hparams.n_embd * hparams.n_ff(i) / 32);
+            if (with_up) {
+                // [unit][n_embd] int8: one contiguous 2 KB row per selected unit, which is what
+                // makes the gathered down run at streaming rate instead of 128 B granules
+                cascade_wt[i] = ggml_new_tensor_2d(ctx, GGML_TYPE_I8,  hparams.n_embd, hparams.n_ff(i));
+                // [block][n_embd] f16 scales: one contiguous row per 32-unit block
+                cascade_st[i] = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, hparams.n_embd, hparams.n_ff(i)/32);
+            } else {
+                cascade_wt[i] = ggml_new_tensor_1d(ctx, GGML_TYPE_I8,  (int64_t) hparams.n_embd * hparams.n_ff(i));
+                cascade_st[i] = ggml_new_tensor_1d(ctx, GGML_TYPE_F32,
+                                                   (int64_t) hparams.n_embd * hparams.n_ff(i) / 32);
+            }
             if (with_up) {
                 cascade_wu[i] = ggml_new_tensor_2d(ctx, GGML_TYPE_I8,
                                                    hparams.n_embd, hparams.n_ff(i));   // unit-major
@@ -1609,18 +1618,35 @@ void llama_model::get_cascade_repack(int il, struct ggml_tensor ** w_t, struct g
             const struct ggml_tensor * src = layers[i].ffn_down;
             const int64_t F = src->ne[0];
             int8_t * wt = (int8_t *) cascade_wt[i]->data;
-            float  * st = (float  *) cascade_st[i]->data;
             const size_t blk_bytes = ggml_type_size(GGML_TYPE_Q8_0);   // 2-byte scale + 32 int8
-            for (int64_t o = 0; o < D; ++o) {
-                const char * row = (const char *) src->data + o*src->nb[1];
-                for (int64_t jb = 0; jb < F/32; ++jb) {
-                    const char * blk = row + (size_t) jb*blk_bytes;
-                    ggml_fp16_t d16;
-                    memcpy(&d16, blk, sizeof(d16));
-                    st[((size_t)(o/128)*(F/32) + jb)*128 + (o%128)] = ggml_fp16_to_fp32(d16);
-                    const int8_t * qs = (const int8_t *) (blk + sizeof(d16));
-                    for (int t = 0; t < 32; ++t) {
-                        wt[((size_t)(o/128)*F + (jb*32 + t))*128 + (o%128)] = qs[t];
+            if (with_up) {
+                ggml_fp16_t * st16 = (ggml_fp16_t *) cascade_st[i]->data;
+                for (int64_t o = 0; o < D; ++o) {
+                    const char * row = (const char *) src->data + o*src->nb[1];
+                    for (int64_t jb = 0; jb < F/32; ++jb) {
+                        const char * blk = row + (size_t) jb*blk_bytes;
+                        ggml_fp16_t d16;
+                        memcpy(&d16, blk, sizeof(d16));
+                        st16[(size_t) jb*D + o] = d16;
+                        const int8_t * qs = (const int8_t *) (blk + sizeof(d16));
+                        for (int t = 0; t < 32; ++t) {
+                            wt[((size_t)(jb*32 + t))*D + o] = qs[t];
+                        }
+                    }
+                }
+            } else {
+                float * st = (float *) cascade_st[i]->data;
+                for (int64_t o = 0; o < D; ++o) {
+                    const char * row = (const char *) src->data + o*src->nb[1];
+                    for (int64_t jb = 0; jb < F/32; ++jb) {
+                        const char * blk = row + (size_t) jb*blk_bytes;
+                        ggml_fp16_t d16;
+                        memcpy(&d16, blk, sizeof(d16));
+                        st[((size_t)(o/128)*(F/32) + jb)*128 + (o%128)] = ggml_fp16_to_fp32(d16);
+                        const int8_t * qs = (const int8_t *) (blk + sizeof(d16));
+                        for (int t = 0; t < 32; ++t) {
+                            wt[((size_t)(o/128)*F + (jb*32 + t))*128 + (o%128)] = qs[t];
+                        }
                     }
                 }
             }

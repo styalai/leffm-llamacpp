@@ -1460,10 +1460,15 @@ typedef struct {
 typedef struct {
     int32_t F;      // number of units
     int32_t k;      // selected units
-    int32_t nch;    // output chunks (n_embd / 128)
+    int32_t D;      // hidden size (outputs)
+    int32_t T;      // threadgroups the unit list is split across
     int32_t ablate; // 1 = skip (timing ablation)
-    int32_t prefix; // 1 = ignore the list and read units 0..k-1 (speed-only granularity probe)
 } ggml_metal_kargs_cascade_down;
+
+typedef struct {
+    int32_t D;      // hidden size
+    int32_t T;      // partials to sum
+} ggml_metal_kargs_cascade_reduce;
 
 typedef struct {
     int32_t F;      // number of units

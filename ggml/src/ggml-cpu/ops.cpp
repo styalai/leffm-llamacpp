@@ -2774,6 +2774,11 @@ void ggml_compute_forward_cascade_down(const struct ggml_compute_params * params
     {
         const struct ggml_tensor * wt = dst->src[2];
         const struct ggml_tensor * st = dst->src[3];
+        if (wt != nullptr && (wt->ne[1] > 1 || st == nullptr || st->type != GGML_TYPE_F32)) {
+            // the repack is in the Metal-only unit-major layout; fall back to the raw quantized
+            // weights rather than reading it with the chunk-layout indexing
+            wt = nullptr;
+        }
         if (wt != nullptr && st != nullptr) {
             const int8_t * Wt = (const int8_t *) wt->data;
             const float  * St = (const float  *) st->data;

@@ -11,135 +11,139 @@
 // 128-byte line per selected unit, coalesced, and applies the block scale once per 32 units.
 kernel void kernel_cascade_down(
         constant ggml_metal_kargs_cascade_down & args,
-        device const char  * wt,
-        device const float * st,
-        device const float * act,
+        device const char  * wt,       // [F, D] int8, one contiguous 2 KB row per unit
+        device const half  * st,       // [F/32, D] f16 scales, one contiguous row per block
+        device const float * act,      // [F]
         device const float * list,     // [k] selected unit ids, ascending
-        device       float * y,
+        device       float * part,     // [T, D] partial sums, one row per threadgroup
         uint tgpig[[threadgroup_position_in_grid]],
         uint tpitg[[thread_position_in_threadgroup]],
         uint ntg[[threads_per_threadgroup]]) {
     if (args.ablate) {
         return;
     }
-    const int F  = args.F;
-    const int K  = args.k;
-    const int ch = (int) tgpig;
+    const int F = args.F;
+    const int K = args.k;
+    const int D = args.D;
+    const int T = args.T;
 
-    device const char4  * W = (device const char4  *) (wt + (size_t) ch * F * 128);
-    device const float4 * S = (device const float4 *) (st + (size_t) ch * (F/32) * 128);
+    // Even split of the ascending list by unit count. Work is balanced (unlike a block-owned
+    // split), and a block cut between two threadgroups is harmless because the block scale
+    // multiplies each partial sum linearly.
+    const int per_tg = (K + T - 1) / T;
+    const int n0 = (int) tgpig * per_tg;
+    const int n1 = min(n0 + per_tg, K);
+    if (n0 >= n1) {
+        return;
+    }
 
-    const int sg   = (int) (tpitg / 32);
-    const int lane = (int) (tpitg % 32);
-    const int nsg  = (int) (ntg / 32);
+    device float * out = part + (size_t) tgpig * D;
 
-    // Even split of the ascending list, so every simdgroup gets the same number of units (block
-    // ownership would match the scale reads to the block but load-balances badly: block occupancy
-    // varies 0..32, and the threadgroup barrier waits on the slowest warp).
-    const int per_sg = (K + nsg - 1) / nsg;
-    const int n0 = sg*per_sg;
-    const int n1 = min(n0 + per_sg, K);
+    // Each thread owns four outputs. The whole threadgroup covers D in one step, so a unit's full
+    // row is read as one 2 KB burst by the threadgroup (16 x 128 B lines) instead of each
+    // threadgroup reading a 128 B granule of the same unit.
+    for (int o = 4*(int) tpitg; o < D; o += 4*(int) ntg) {
+        float4 acc  = float4(0.0f);
+        float4 ablk = float4(0.0f);
+        int cur_b = -1;
 
-    // LLAMA_CASCADE_DOWN_PREFIX: read units 0..K-1 instead of the selected list. The result is
-    // wrong on purpose -- it turns every chunk into a sequential stream, which isolates "the
-    // gathered access granularity is the limiter" from every other explanation.
-    const bool prefix = args.prefix != 0;
-
-    threadgroup float4 part[32][32];
-
-    float4 acc  = float4(0.0f);
-    float4 ablk = float4(0.0f);
-    int cur_b = -1;
-
-    int n = n0;
-    while (n < n1) {
-        if (n + 8 <= n1) {
-            // eight ids: two vector loads for the ids, eight independent line loads in flight
-            const float4 ia = *(device const float4 *) (list + n);
-            const float4 ib = *(device const float4 *) (list + n + 4);
-            const int j0 = prefix ? n     : (int) ia.x;
-            const int j7 = prefix ? n + 7 : (int) ib.w;
-            const int b8 = j0 >> 5;
-            if (b8 == (j7 >> 5)) {
-                if (b8 != cur_b) {
-                    if (cur_b >= 0) {
-                        acc += ablk * S[(size_t) cur_b*32 + lane];
+        int n = n0;
+        while (n < n1) {
+            if (n + 8 <= n1) {
+                const float4 ia = *(device const float4 *) (list + n);
+                const float4 ib = *(device const float4 *) (list + n + 4);
+                const int j0 = (int) ia.x;
+                const int j7 = (int) ib.w;
+                const int b  = j0 >> 5;
+                if (b == (j7 >> 5)) {
+                    if (b != cur_b) {
+                        if (cur_b >= 0) {
+                            const half4 h = *(device const half4 *) (st + (size_t) cur_b*D + o);
+                            acc += ablk * float4((float) h.x, (float) h.y, (float) h.z, (float) h.w);
+                        }
+                        cur_b = b;
+                        ablk  = float4(0.0f);
                     }
-                    cur_b = b8;
-                    ablk = float4(0.0f);
-                }
-                const int j[8] = { j0,
-                                   prefix ? n + 1 : (int) ia.y,
-                                   prefix ? n + 2 : (int) ia.z,
-                                   prefix ? n + 3 : (int) ia.w,
-                                   prefix ? n + 4 : (int) ib.x,
-                                   prefix ? n + 5 : (int) ib.y,
-                                   prefix ? n + 6 : (int) ib.z,
-                                   j7 };
-                char4 w[8];
-                for (int u = 0; u < 8; ++u) {
-                    w[u] = W[(size_t) j[u]*32 + lane];
-                }
-                for (int u = 0; u < 8; ++u) {
-                    ablk += float4(act[j[u]]) * float4(w[u]);
-                }
-                n += 8;
-                continue;
-            }
-        }
-        if (n + 4 <= n1) {
-            const float4 ids = *(device const float4 *) (list + n);
-            const int j0 = (int) ids.x;
-            const int j3 = (int) ids.w;
-            const int b4 = j0 >> 5;
-            if (b4 == (j3 >> 5)) {
-                if (b4 != cur_b) {
-                    if (cur_b >= 0) {
-                        acc += ablk * S[(size_t) cur_b*32 + lane];
+                    const int j[8] = { j0, (int) ia.y, (int) ia.z, (int) ia.w,
+                                       (int) ib.x, (int) ib.y, (int) ib.z, j7 };
+                    char4 w[8];
+                    for (int u = 0; u < 8; ++u) {
+                        w[u] = *(device const char4 *) (wt + (size_t) j[u]*D + o);
                     }
-                    cur_b = b4;
-                    ablk = float4(0.0f);
+                    for (int u = 0; u < 8; ++u) {
+                        ablk += float4(act[j[u]]) * float4(w[u]);
+                    }
+                    n += 8;
+                    continue;
                 }
-                const char4 w0 = W[(size_t) j0*32 + lane];
-                const char4 w1 = W[(size_t)(int) ids.y*32 + lane];
-                const char4 w2 = W[(size_t)(int) ids.z*32 + lane];
-                const char4 w3 = W[(size_t) j3*32 + lane];
-                ablk += float4(act[j0]) * float4(w0)
-                      + float4(act[(int) ids.y]) * float4(w1)
-                      + float4(act[(int) ids.z]) * float4(w2)
-                      + float4(act[j3]) * float4(w3);
-                n += 4;
-                continue;
+            }
+            if (n + 4 <= n1) {
+                const float4 ids = *(device const float4 *) (list + n);
+                const int j[4] = { (int) ids.x, (int) ids.y, (int) ids.z, (int) ids.w };
+                if ((j[0] >> 5) == (j[3] >> 5)) {
+                    const int b = j[0] >> 5;
+                    if (b != cur_b) {
+                        if (cur_b >= 0) {
+                            const half4 h = *(device const half4 *) (st + (size_t) cur_b*D + o);
+                            acc += ablk * float4((float) h.x, (float) h.y, (float) h.z, (float) h.w);
+                        }
+                        cur_b = b;
+                        ablk  = float4(0.0f);
+                    }
+                    const char4 w0 = *(device const char4 *) (wt + (size_t) j[0]*D + o);
+                    const char4 w1 = *(device const char4 *) (wt + (size_t) j[1]*D + o);
+                    const char4 w2 = *(device const char4 *) (wt + (size_t) j[2]*D + o);
+                    const char4 w3 = *(device const char4 *) (wt + (size_t) j[3]*D + o);
+                    ablk += float4(act[j[0]]) * float4(w0)
+                          + float4(act[j[1]]) * float4(w1)
+                          + float4(act[j[2]]) * float4(w2)
+                          + float4(act[j[3]]) * float4(w3);
+                    n += 4;
+                    continue;
+                }
+            }
+            {
+                const int j = (int) list[n];
+                const int b = j >> 5;
+                if (b != cur_b) {
+                    if (cur_b >= 0) {
+                        const half4 h = *(device const half4 *) (st + (size_t) cur_b*D + o);
+                        acc += ablk * float4((float) h.x, (float) h.y, (float) h.z, (float) h.w);
+                    }
+                    cur_b = b;
+                    ablk  = float4(0.0f);
+                }
+                const char4 w = *(device const char4 *) (wt + (size_t) j*D + o);
+                ablk += float4(act[j]) * float4(w);
+                ++n;
             }
         }
-        // a group that straddles a block boundary, or the tail
-        {
-            const int j = (int) list[n];
-            const int b = j >> 5;
-            if (b != cur_b) {
-                if (cur_b >= 0) {
-                    acc += ablk * S[(size_t) cur_b*32 + lane];
-                }
-                cur_b = b;
-                ablk = float4(0.0f);
-            }
-            ablk += float4(act[j]) * float4(W[(size_t) j*32 + lane]);
-            ++n;
+        if (cur_b >= 0) {
+            const half4 h = *(device const half4 *) (st + (size_t) cur_b*D + o);
+            acc += ablk * float4((float) h.x, (float) h.y, (float) h.z, (float) h.w);
         }
+        *(device float4 *) (out + o) = acc;
     }
-    if (cur_b >= 0) {
-        acc += ablk * S[(size_t) cur_b*32 + lane];
-    }
+}
 
-    part[sg][lane] = acc;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (sg == 0) {
-        float4 sum = float4(0.0f);
-        for (int t = 0; t < nsg; ++t) {
-            sum += part[t][lane];
-        }
-        ((device float4 *) y)[(size_t) ch*32 + lane] = sum;
+kernel void kernel_cascade_down_reduce(
+        constant ggml_metal_kargs_cascade_reduce & args,
+        device const float * part,     // [T, D]
+        device       float * y,        // [D]
+        uint tgpig[[threadgroup_position_in_grid]],
+        uint tpitg[[thread_position_in_threadgroup]],
+        uint ntg[[threads_per_threadgroup]]) {
+    const int D = args.D;
+    const int T = args.T;
+    const int o = (int) tgpig * (int) ntg + (int) tpitg;
+    if (o >= D) {
+        return;
     }
+    float s = 0.0f;
+    for (int t = 0; t < T; ++t) {
+        s += part[(size_t) t*D + o];
+    }
+    y[o] = s;
 }
 
 // Exact top-c / top-k selection in a single threadgroup: positive floats are monotone in their bit

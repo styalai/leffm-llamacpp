@@ -2248,12 +2248,17 @@ extern "C" {
     // `w_t` / `s_t` are the optional unit-major repack of a Q8_0 `w_down` (int8 [64, F, D/64] and
     // f32 [64, F/32, D/64]); when present the down becomes a chunked axpy over units with no
     // per-block dequant and no cross-thread reduce. Pass NULL to use `w_down` directly.
-    GGML_API struct ggml_tensor * ggml_cascade_down(
+    GGML_API // number of threadgroups the Metal down kernel splits the selected unit list across; the scratch
+// tensor holds one [n_embd] float partial per threadgroup
+#define GGML_CASCADE_DOWN_NTG 16
+
+struct ggml_tensor * ggml_cascade_down(
             struct ggml_context * ctx,
             struct ggml_tensor  * sel,
             struct ggml_tensor  * w_down,
             struct ggml_tensor  * w_t,
             struct ggml_tensor  * s_t,
+            struct ggml_tensor  * scratch,
             int                   k);
 
     GGML_API struct ggml_tensor * ggml_arange(

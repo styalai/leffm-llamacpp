@@ -106,7 +106,11 @@ ggml_tensor * llm_build_lfm_base::build_lfm_cascade_ffn(ggml_tensor * cur, int i
     struct ggml_tensor * w_t = nullptr;
     struct ggml_tensor * s_t = nullptr;
     model.get_cascade_repack(il, &w_t, &s_t);
-    struct ggml_tensor * y = ggml_cascade_down(ctx0, sel, model.layers[il].ffn_down, w_t, s_t, k);
+    // Metal splits the selected list across GGML_CASCADE_DOWN_NTG threadgroups, each producing a
+    // full [n_embd] partial that a tiny second dispatch sums (deterministic, no atomics)
+    struct ggml_tensor * part = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32,
+                                                   GGML_CASCADE_DOWN_NTG * model.hparams.n_embd);
+    struct ggml_tensor * y = ggml_cascade_down(ctx0, sel, model.layers[il].ffn_down, w_t, s_t, part, k);
     cb(y, "model.layers.{}.ffn_cascade_down", il);
     return y;
 }

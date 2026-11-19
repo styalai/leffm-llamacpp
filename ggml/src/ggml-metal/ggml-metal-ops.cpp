@@ -4592,39 +4592,56 @@ int ggml_metal_op_cascade_down(ggml_metal_op_t ctx, int idx) {
     ggml_metal_library_t lib = ctx->lib;
     ggml_metal_encoder_t enc = ctx->enc;
 
-    auto pipeline = ggml_metal_library_get_pipeline_cascade_down(lib, op);
+    auto pipe       = ggml_metal_library_get_pipeline_cascade_down  (lib, op);
+    auto pipe_redux = ggml_metal_library_get_pipeline_cascade_reduce(lib);
 
-    ggml_tensor * sel  = op->src[0];   // rows: 0 scores, 1 unit ids (f32), 2 activations
-    ggml_tensor * wt   = op->src[2];
-    ggml_tensor * st   = op->src[3];
+    ggml_tensor * sel  = op->src[0];   // rows: 0 activations, 1 mask1, 2 ascending unit ids
+    ggml_tensor * wt   = op->src[2];   // [n_ff, n_embd] int8, one row per unit
+    ggml_tensor * st   = op->src[3];   // [n_ff/32, n_embd] f16, one row per 32-unit block
+    ggml_tensor * part = op->src[4];   // [NTG, n_embd] partial sums
 
-    const int64_t F   = sel->ne[0];
-    const int64_t nch = op->ne[0] / 128;
-    const int64_t k   = ggml_get_op_params_i32(op, 0);
+    const int64_t F = sel->ne[0];
+    const int64_t D = op->ne[0];
+    const int64_t k = ggml_get_op_params_i32(op, 0);
+    const int     T = GGML_CASCADE_DOWN_NTG;
+    (void) op->src[1];   // w_down (the repacks replace it)
 
     ggml_metal_kargs_cascade_down args = {
         /*.F   =*/ (int32_t) F,
         /*.k   =*/ (int32_t) k,
-        /*.nch =*/ (int32_t) nch,
+        /*.D   =*/ (int32_t) D,
+        /*.T   =*/ (int32_t) T,
         /*.ablate =*/ (int32_t) ((cascade_ablate() & 8) != 0),
-        /*.prefix =*/ (int32_t) (getenv("LLAMA_CASCADE_DOWN_PREFIX") != nullptr),
     };
-    (void) op->src[1];   // w_down (unused: the repacked wt/st replace it)
 
     ggml_metal_buffer_id bid_sel  = ggml_metal_get_buffer_id(sel);
     ggml_metal_buffer_id bid_act  = { bid_sel.metal, bid_sel.offs              };
-    ggml_metal_buffer_id bid_list = { bid_sel.metal, bid_sel.offs + 2*sel->nb[1] };  // ascending ids
+    ggml_metal_buffer_id bid_list = { bid_sel.metal, bid_sel.offs + 2*sel->nb[1] };
 
-    int arg_idx{0};
-    ggml_metal_encoder_set_pipeline(enc, pipeline);
-    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), arg_idx++);
-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(wt), arg_idx++);
-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(st), arg_idx++);
-    ggml_metal_encoder_set_buffer  (enc, bid_act,  arg_idx++);
-    ggml_metal_encoder_set_buffer  (enc, bid_list, arg_idx++);
-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op), arg_idx++);
+    {
+        // one threadgroup per slice of the unit list, 512 threads covering all n_embd outputs
+        int arg_idx{0};
+        ggml_metal_encoder_set_pipeline(enc, pipe);
+        ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), arg_idx++);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(wt),   arg_idx++);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(st),   arg_idx++);
+        ggml_metal_encoder_set_buffer  (enc, bid_act,  arg_idx++);
+        ggml_metal_encoder_set_buffer  (enc, bid_list, arg_idx++);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(part), arg_idx++);
 
-    ggml_metal_encoder_dispatch_threadgroups(enc, nch, 1, 1, 512, 1, 1);
+        ggml_metal_encoder_dispatch_threadgroups(enc, T, 1, 1, 512, 1, 1);
+    }
+    ggml_metal_encoder_memory_barrier(enc);
+    {
+        ggml_metal_kargs_cascade_reduce args_r = { (int32_t) D, (int32_t) T };
+        int arg_idx{0};
+        ggml_metal_encoder_set_pipeline(enc, pipe_redux);
+        ggml_metal_encoder_set_bytes   (enc, &args_r, sizeof(args_r), arg_idx++);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(part), arg_idx++);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),   arg_idx++);
+
+        ggml_metal_encoder_dispatch_threadgroups(enc, (int) ((D + 255)/256), 1, 1, 256, 1, 1);
+    }
 
     return 1;
 }
