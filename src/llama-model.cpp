@@ -1463,6 +1463,254 @@ llama_model::~llama_model() {
     for (auto * lora : loras) {
         delete lora;
     }
+    for (auto * b : cascade_bufs) {
+        ggml_backend_buffer_free(b);
+    }
+    for (auto * c : cascade_ctxs) {
+        ggml_free(c);
+    }
+}
+
+struct ggml_tensor * llama_model::get_cascade_up_s(int il) const {
+    struct ggml_tensor * dummy_w = nullptr;
+    struct ggml_tensor * dummy_s = nullptr;
+    get_cascade_repack(il, &dummy_w, &dummy_s);
+    return ((int) cascade_wus.size() == (int) layers.size()) ? cascade_wus[il] : nullptr;
+}
+
+struct ggml_tensor * llama_model::get_cascade_up_w(int il) const {
+    struct ggml_tensor * dummy_w = nullptr;
+    struct ggml_tensor * dummy_s = nullptr;
+    get_cascade_repack(il, &dummy_w, &dummy_s);
+    return ((int) cascade_wu.size() == (int) layers.size()) ? cascade_wu[il] : nullptr;
+}
+
+// Lossless Q8_0 repack of ffn_down for the cascade down projection:
+//   wt[chunk][unit][i64]  int8   -- one 64-byte line per (64-output chunk, unit)
+//   st[chunk][block][i64] float  -- scale of the original (output, 32-unit block)
+// The int8 values and scales are copied, never requantized.
+void llama_model::get_cascade_repack(int il, struct ggml_tensor ** w_t, struct ggml_tensor ** s_t) const {
+    std::lock_guard<std::mutex> lock(cascade_mutex);
+    if (!cascade_repack_done) {
+        const int n_layer = (int) layers.size();
+
+        bool ok = hparams.n_embd % 128 == 0 && n_layer > 0;
+
+        const struct ggml_tensor * w0 = layers[0].ffn_down;
+        ggml_backend_buffer_type_t buft = nullptr;
+        if (w0 != nullptr && w0->buffer != nullptr) {
+            ggml_backend_buffer_type_t b = ggml_backend_buffer_get_type(w0->buffer);
+            ggml_backend_dev_t          d = ggml_backend_buft_get_device(b);
+            if (d != nullptr && (ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_GPU ||
+                                 ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_CPU)) {
+                buft = b;
+            }
+        }
+        if (buft == nullptr) {
+            ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+            if (dev == nullptr) {
+                dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+            }
+            buft = ggml_backend_dev_buffer_type(dev);
+        }
+
+        // the unit-major up repack is read by the Metal kernels only: the CPU up op gathers from
+        // the original ffn_up, so a host-resident model must not pay for it
+        const bool with_up = ggml_backend_dev_type(ggml_backend_buft_get_device(buft)) ==
+                             GGML_BACKEND_DEVICE_TYPE_GPU;
+
+        size_t total = 0;
+        for (int i = 0; i < n_layer && ok; ++i) {
+            const struct ggml_tensor * src = layers[i].ffn_down;
+            const struct ggml_tensor * up  = layers[i].ffn_up;
+            if (src == nullptr || src->data == nullptr ||          // weights not mapped yet
+                src->type != GGML_TYPE_Q8_0 || src->ne[0] % 32 != 0 ||
+                up == nullptr || up->data == nullptr || up->type != GGML_TYPE_Q8_0) {
+                ok = false;
+                break;
+            }
+            total += (size_t) hparams.n_embd * hparams.n_ff(i);                    // int8
+            total += (size_t) hparams.n_embd * hparams.n_ff(i) / 32 * sizeof(float); // scales
+            if (with_up) {
+                total += (size_t) hparams.n_embd * hparams.n_ff(i);                        // up, int8
+                total += (size_t) hparams.n_ff(i) * (size_t) hparams.n_embd / 32 * sizeof(float); // up scales
+            }
+        }
+        if (!ok) {
+            return;   // retry on the next graph build
+        }
+        cascade_repack_done = true;
+
+        ggml_init_params ip = { ggml_tensor_overhead()*(size_t)(2*n_layer + 4) + 65536, nullptr, true };
+        struct ggml_context * ctx = ggml_init(ip);
+        cascade_ctxs.push_back(ctx);
+        cascade_wt.assign(n_layer, nullptr);
+        cascade_st.assign(n_layer, nullptr);
+        cascade_wu.assign(n_layer, nullptr);
+        cascade_wus.assign(n_layer, nullptr);
+        for (int i = 0; i < n_layer; ++i) {
+            cascade_wt[i] = ggml_new_tensor_1d(ctx, GGML_TYPE_I8,  (int64_t) hparams.n_embd * hparams.n_ff(i));
+            cascade_st[i] = ggml_new_tensor_1d(ctx, GGML_TYPE_F32,
+                                               (int64_t) hparams.n_embd * hparams.n_ff(i) / 32);
+            if (with_up) {
+                cascade_wu[i] = ggml_new_tensor_2d(ctx, GGML_TYPE_I8,
+                                                   hparams.n_embd, hparams.n_ff(i));   // unit-major
+                cascade_wus[i] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,
+                                                    hparams.n_embd / 32, hparams.n_ff(i));
+            }
+            if (cascade_wt[i] == nullptr || cascade_st[i] == nullptr ||
+                (with_up && (cascade_wu[i] == nullptr || cascade_wus[i] == nullptr))) {
+                fprintf(stderr, "%s: could not create cascade repack tensors\n", __func__);
+                return;
+            }
+        }
+
+        // the kernels read the repack directly, so it lives in the same buffer type as the weights
+        ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(buft, total);
+        ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        char * base = (char *) ggml_backend_buffer_get_base(buf);
+        size_t off = 0;
+        for (int i = 0; i < n_layer; ++i) {
+            for (struct ggml_tensor * t : { cascade_wt[i], cascade_st[i], cascade_wu[i], cascade_wus[i] }) {
+                if (t == nullptr) {
+                    continue;
+                }
+                t->data   = base + off;
+                t->buffer = buf;
+                off += ggml_nbytes(t);
+            }
+        }
+        cascade_bufs.push_back(buf);
+
+        const int64_t D = hparams.n_embd;
+        for (int i = 0; i < n_layer; ++i) {
+            const struct ggml_tensor * up_src = layers[i].ffn_up;
+            int8_t * wud = with_up ? (int8_t *) cascade_wu[i]->data : nullptr;
+            float  * wsd = with_up ? (float  *) cascade_wus[i]->data : nullptr;
+            if (with_up && up_src != nullptr && up_src->type == GGML_TYPE_Q8_0 && up_src->data != nullptr) {
+                const size_t blk = ggml_type_size(GGML_TYPE_Q8_0);   // 2-byte scale + 32 int8
+                for (int64_t j = 0; j < hparams.n_ff(i); ++j) {
+                    const char * rp = (const char *) up_src->data + (size_t) j*up_src->nb[1];
+                    for (int64_t b = 0; b < D/32; ++b) {
+                        ggml_fp16_t d16;
+                        memcpy(&d16, rp + b*blk, sizeof(d16));
+                        const float d = ggml_fp16_to_fp32(d16);
+                        const int8_t * qs = (const int8_t *) (rp + b*blk + sizeof(d16));
+                        wsd[(size_t) j*(D/32) + b] = d;
+                        for (int t = 0; t < 32; ++t) {
+                            wud[(size_t) j*D + b*32 + t] = qs[t];
+                        }
+                    }
+                }
+            }
+            const struct ggml_tensor * src = layers[i].ffn_down;
+            const int64_t F = src->ne[0];
+            int8_t * wt = (int8_t *) cascade_wt[i]->data;
+            float  * st = (float  *) cascade_st[i]->data;
+            const size_t blk_bytes = ggml_type_size(GGML_TYPE_Q8_0);   // 2-byte scale + 32 int8
+            for (int64_t o = 0; o < D; ++o) {
+                const char * row = (const char *) src->data + o*src->nb[1];
+                for (int64_t jb = 0; jb < F/32; ++jb) {
+                    const char * blk = row + (size_t) jb*blk_bytes;
+                    ggml_fp16_t d16;
+                    memcpy(&d16, blk, sizeof(d16));
+                    st[((size_t)(o/128)*(F/32) + jb)*128 + (o%128)] = ggml_fp16_to_fp32(d16);
+                    const int8_t * qs = (const int8_t *) (blk + sizeof(d16));
+                    for (int t = 0; t < 32; ++t) {
+                        wt[((size_t)(o/128)*F + (jb*32 + t))*128 + (o%128)] = qs[t];
+                    }
+                }
+            }
+        }
+    }
+    if ((int) cascade_wt.size() == (int) layers.size()) {
+        *w_t = cascade_wt[il];
+        *s_t = cascade_st[il];
+    }
+}
+
+// Vocabulary cut for the cascade recipe, run once after the weights are loaded: gather the kept
+// rows of the (tied) head into a smaller matrix, keep the id list, and a -inf base so the graph can
+// scatter the trimmed logits back into the full [n_vocab, n_tokens] space (sampling unchanged).
+void llama_model::load_tensors_cascade() {
+    const char * path = getenv("LLAMA_CASCADE_VOCAB");
+    if (path == nullptr) {
+        return;
+    }
+    const struct ggml_tensor * src = (output != nullptr && output->data != nullptr) ? output : tok_embd;
+    if (src == nullptr || src->data == nullptr) {
+        fprintf(stderr, "%s: no head weights to cut\n", __func__);
+        return;
+    }
+    std::vector<int32_t> ids;
+    {
+        FILE * f = fopen(path, "r");
+        if (f == nullptr) {
+            fprintf(stderr, "%s: cannot open %s\n", __func__, path);
+            return;
+        }
+        int v;
+        while (fscanf(f, "%d", &v) == 1) {
+            ids.push_back(v);
+        }
+        fclose(f);
+    }
+    const int64_t n_vocab = (int64_t) vocab.n_tokens();
+    if (ids.empty() || (int64_t) ids.size() > n_vocab) {
+        fprintf(stderr, "%s: bad id list (%zu)\n", __func__, ids.size());
+        return;
+    }
+    const int64_t Vt = (int64_t) ids.size();
+    const size_t row_bytes = ggml_row_size(src->type, hparams.n_embd);
+
+    ggml_init_params ip = { ggml_tensor_overhead()*8 + 65536, nullptr, true };
+    struct ggml_context * ctx = ggml_init(ip);
+    cascade_ctxs.push_back(ctx);
+    struct ggml_tensor * w    = ggml_new_tensor_2d(ctx, src->type, hparams.n_embd, Vt);
+    struct ggml_tensor * idxs = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, Vt);
+    struct ggml_tensor * base = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+
+    ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
+    const size_t total = row_bytes*Vt + sizeof(int32_t)*Vt + sizeof(float);
+    ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(buft, total);
+    ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    char * bbase = (char *) ggml_backend_buffer_get_base(buf);
+    size_t off = 0;
+    for (struct ggml_tensor * t : { w, idxs, base }) {
+        t->data   = bbase + off;
+        t->buffer = buf;
+        off += ggml_nbytes(t);
+    }
+    cascade_bufs.push_back(buf);
+
+    int8_t * wdst = (int8_t *) w->data;
+    int32_t * idst = (int32_t *) idxs->data;
+    for (int64_t i = 0; i < Vt; ++i) {
+        const int32_t id = ids[i];
+        if (id < 0 || id >= n_vocab) {
+            continue;
+        }
+        memcpy(wdst + i*row_bytes, (const char *) src->data + (size_t) id*src->nb[1], row_bytes);
+        idst[i] = id;
+    }
+    ((float *) base->data)[0] = -1e9f;
+
+    cascade_head_w    = w;
+    cascade_head_idx  = idxs;
+    cascade_head_base = base;
+    cascade_head_done = true;
+    fprintf(stderr, "%s: head cut to %lld of %lld ids (%.1f MB)\n", __func__,
+            (long long) Vt, (long long) n_vocab, row_bytes*Vt/1e6);
+}
+
+void llama_model::get_cascade_head(struct ggml_tensor ** w_out, struct ggml_tensor ** idx_out,
+                                        struct ggml_tensor ** base_out) const {
+    if (cascade_head_done) {
+        *w_out    = cascade_head_w;
+        *idx_out  = cascade_head_idx;
+        *base_out = cascade_head_base;
+    }
 }
 
 void llama_model_base::load_stats(llama_model_loader & ml) {
@@ -2196,6 +2444,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     load_tensors_hadamard();
+    load_tensors_cascade();
 
     return true;
 }

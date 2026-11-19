@@ -2811,6 +2811,31 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_opt_step_sgd(ggm
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cascade_sel(ggml_metal_library_t lib) {
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, "kernel_cascade_sel");
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, "kernel_cascade_sel", "kernel_cascade_sel", nullptr);
+    }
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cascade_up(ggml_metal_library_t lib) {
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, "kernel_cascade_up");
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, "kernel_cascade_up", "kernel_cascade_up", nullptr);
+    }
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cascade_down(ggml_metal_library_t lib, const ggml_tensor * op) {
+    assert(op->op == GGML_OP_CASCADE_DOWN);
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, "kernel_cascade_down");
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, "kernel_cascade_down", "kernel_cascade_down", nullptr);
+    }
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_silu_back(ggml_metal_library_t lib, const ggml_tensor * op) {
     assert(op->op == GGML_OP_SILU_BACK);
 

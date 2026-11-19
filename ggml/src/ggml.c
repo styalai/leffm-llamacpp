@@ -1114,9 +1114,12 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 
     "SLEEP",
+
+    "CASCADE_UP",
+    "CASCADE_DOWN",
 };
 
-static_assert(GGML_OP_COUNT == 100, "GGML_OP_COUNT != 100");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1229,9 +1232,12 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 
     "sleep(x)",
+
+    "cascade_up(x)",
+    "cascade_down(x)",
 };
 
-static_assert(GGML_OP_COUNT == 100, "GGML_OP_COUNT != 100");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5381,6 +5387,57 @@ struct ggml_tensor * ggml_top_k(
 
     result->op     = GGML_OP_TOP_K;
     result->src[0] = a;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_cascade_up(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * w_up,
+        struct ggml_tensor  * w_up_t,
+        struct ggml_tensor  * w_up_s,
+        int                   c,
+        int                   k) {
+    GGML_ASSERT(g->type     == GGML_TYPE_F32);
+    GGML_ASSERT(x->type     == GGML_TYPE_F32);
+    GGML_ASSERT(w_up->ne[0] == x->ne[0]);
+    GGML_ASSERT(w_up->ne[1] == g->ne[0]);
+    GGML_ASSERT(c <= g->ne[0] && k <= c);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, g->ne[0], 3);
+
+    result->op     = GGML_OP_CASCADE_UP;
+    result->src[0] = g;
+    result->src[1] = x;
+    result->src[2] = w_up;
+    result->src[3] = w_up_t;
+    result->src[4] = w_up_s;
+    ggml_set_op_params_i32(result, 0, c);
+    ggml_set_op_params_i32(result, 1, k);
+
+    return result;
+}
+
+struct ggml_tensor * ggml_cascade_down(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * sel,
+        struct ggml_tensor  * w_down,
+        struct ggml_tensor  * w_t,
+        struct ggml_tensor  * s_t,
+        int                   k) {
+    GGML_ASSERT(sel->type == GGML_TYPE_F32);
+    GGML_ASSERT(w_down->ne[0] == sel->ne[0]);
+
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, w_down->ne[1]);
+
+    result->op     = GGML_OP_CASCADE_DOWN;
+    result->src[0] = sel;
+    result->src[1] = w_down;
+    result->src[2] = w_t;
+    result->src[3] = s_t;
+    ggml_set_op_params_i32(result, 0, k);
 
     return result;
 }

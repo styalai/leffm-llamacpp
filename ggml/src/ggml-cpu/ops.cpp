@@ -9,6 +9,10 @@
 #include "vec.h"
 
 #include <algorithm>
+#include <chrono>
+#include <mutex>
+#include <cstdio>
+#include <cstdlib>
 #include <cfloat>
 #include <cmath>
 
@@ -2564,6 +2568,360 @@ static void ggml_compute_forward_gelu_quick(
             {
                 GGML_ABORT("fatal error");
             }
+    }
+}
+
+// Order entries by 32-unit block with a counting sort: O(n), no comparisons, and the order within
+// a block stays arbitrary - which is all that is needed (the down groups equal-block runs, and the
+// up keeps row locality at block granularity). Replaces std::sort over 5,120 + 2,304 indices.
+static void cascade_order_by_block(const float * key, const float * val, int n,
+                                   int n_blk, float * okey, float * oval) {
+    std::vector<int32_t> cnt((size_t) n_blk + 1, 0);
+    for (int i = 0; i < n; ++i) {
+        cnt[(((int) key[i]) >> 5) + 1]++;
+    }
+    for (int b = 0; b < n_blk; ++b) {
+        cnt[b + 1] += cnt[b];
+    }
+    for (int i = 0; i < n; ++i) {
+        const int p = cnt[((int) key[i]) >> 5]++;
+        okey[p] = key[i];
+        if (oval != nullptr) {
+            oval[p] = val[i];
+        }
+    }
+}
+
+// ---- optional per-op timing (LLAMA_CASCADE_PERF=1)
+static void cascade_perf(int which, double us) {
+    static const bool on = getenv("LLAMA_CASCADE_PERF") != nullptr;
+    if (!on) {
+        return;
+    }
+    static std::mutex mu;
+    static double tot[2] = { 0, 0 };
+    static long   cnt[2] = { 0, 0 };
+    std::lock_guard<std::mutex> lk(mu);
+    tot[which] += us;
+    if (++cnt[which] % 240 == 0) {
+        fprintf(stderr, "[cascade] %s: %.1f us/op (thread 0), %ld ops\n",
+                which ? "down" : "up", tot[which]/cnt[which], cnt[which]);
+    }
+}
+
+// ggml_compute_forward_cascade_up
+//
+// LFM3 cascade FFN, stage 1.  dst is [F, 3] f32:
+//   row 0  scratch: |silu(g_j)|
+//   row 1  unit indices, ascending
+//   row 2  activations silu(g_j) * u_j
+// On output rows 1 and 2 hold the first k entries (the executed units and their activations).
+//
+// The two selections are exact: positive IEEE-754 floats are monotone in their bit pattern, so
+// bisecting [bits(min), bits(max)] 32 times finds the exact c-th (k-th) largest value.
+void ggml_compute_forward_cascade_up(const struct ggml_compute_params * params,
+                                      struct ggml_tensor * dst) {
+    const struct ggml_tensor * g    = dst->src[0];
+    const struct ggml_tensor * x    = dst->src[1];
+    const struct ggml_tensor * w_up = dst->src[2];
+
+    const int64_t F = g->ne[0];
+    const int64_t d = x->ne[0];
+    const int     c = ggml_get_op_params_i32(dst, 0);
+    const int     k = ggml_get_op_params_i32(dst, 1);
+
+    const int nth = params->nth;
+    const int ith = params->ith;
+
+    float * s   = (float *) dst->data;
+    float * idx = (float *) ((char *) dst->data + dst->nb[1]);
+    float * act = (float *) ((char *) dst->data + 2*dst->nb[1]);
+
+    const float * gp = (const float *) g->data;
+    const float * xp = (const float *) x->data;
+
+    const double t_op0 = ith == 0 ? (double) std::chrono::duration<double, std::micro>(
+        std::chrono::steady_clock::now().time_since_epoch()).count() : 0.0;
+
+    // ---- phase 1 (thread 0): scores, exact top-c, ascending order
+    // CPU selection: nth_element is O(n) and beats a 32-pass bit-space bisection ~3-4x here.
+    // It returns the same set (the c-th largest is exact), and the ascending sort lets the down
+    // kernel walk quant blocks in order.
+    // phase 1a (all threads): |silu(g)| is the expensive part (one expf per unit)
+    {
+        const int64_t per = (F + nth - 1)/nth;
+        const int64_t j0 = per*ith, j1 = MIN(j0 + per, F);
+        for (int64_t j = j0; j < j1; ++j) {
+            const float v = gp[j];
+            s[j] = fabsf(v / (1.0f + expf(-v)));
+        }
+    }
+    ggml_barrier(params->threadpool);
+
+    if (ith == 0) {
+        std::vector<int32_t> ids((size_t) F);
+        for (int64_t j = 0; j < F; ++j) {
+            ids[j] = (int32_t) j;
+        }
+        std::nth_element(ids.begin(), ids.begin() + c, ids.end(),
+                         [s](int32_t a, int32_t b) { return s[a] > s[b]; });
+        if (getenv("LLAMA_CASCADE_MARGIN")) {
+            float s_c = s[ids[c-1]], s_n = 0.0f;
+            for (int64_t i = c; i < F; ++i) { s_n = MAX(s_n, s[ids[i]]); }
+            fprintf(stderr, "[cascade] up  margin: c-th %.7g  next %.7g  rel %.3g\n",
+                    (double) s_c, (double) s_n, (double) (s_c - s_n) / (double) s_c);
+        }
+        std::vector<float> tmp((size_t) c);
+        for (int64_t i = 0; i < c; ++i) {
+            tmp[i] = (float) ids[i];
+        }
+        cascade_order_by_block(tmp.data(), nullptr, (int) c, (int) (F/32), idx, nullptr);
+    }
+    ggml_barrier(params->threadpool);
+    const double t_sel = ith == 0 ? (double) std::chrono::duration<double, std::micro>(
+        std::chrono::steady_clock::now().time_since_epoch()).count() : 0.0;
+
+    // ---- phase 2 (all threads): gather-dot the selected up rows with the ggml SIMD dot
+    {
+        const enum ggml_type vdt = ggml_get_type_traits_cpu(w_up->type)->vec_dot_type;
+        ggml_from_float_t const qx = ggml_get_type_traits_cpu(vdt)->from_float;
+        ggml_vec_dot_t    const dot = ggml_get_type_traits_cpu(w_up->type)->vec_dot;
+        void * xq = malloc(ggml_row_size(vdt, d));
+        qx(xp, xq, d);
+        const int64_t per = (c + nth - 1)/nth;
+        const int64_t i0 = per*ith, i1 = MIN(i0 + per, (int64_t) c);
+        for (int64_t i = i0; i < i1; ++i) {
+            const int64_t j = (int64_t) idx[i];
+            const char * rp = (const char *) w_up->data + j*w_up->nb[1];
+            if (i + 8 < i1) {   // rows are 2 KB and gathered: warm the next ones' first lines
+                const char * pf = (const char *) w_up->data + (int64_t) idx[i + 8]*w_up->nb[1];
+                __builtin_prefetch(pf,       0, 1);
+                __builtin_prefetch(pf + 64,  0, 1);
+                __builtin_prefetch(pf + 128, 0, 1);
+            }
+            float acc = 0.0f;
+            dot((int) d, &acc, 0, rp, 0, xq, 0, 1);
+            const float gv = gp[j];
+            act[i] = (gv / (1.0f + expf(-gv))) * acc;
+        }
+        free(xq);
+    }
+    ggml_barrier(params->threadpool);
+
+    // ---- phase 3 (thread 0): exact top-k of |act|, compacted in ascending order
+    if (ith == 0) {
+        std::vector<int32_t> ids((size_t) c);
+        for (int i = 0; i < c; ++i) {
+            ids[i] = i;
+            s[i] = fabsf(act[i]);          // row 0 is free: comparators then do no fabsf work
+        }
+        std::nth_element(ids.begin(), ids.begin() + k, ids.end(),
+                         [s](int32_t a, int32_t b) { return s[a] > s[b]; });
+        if (getenv("LLAMA_CASCADE_MARGIN")) {
+            float a_k = s[ids[k-1]], a_n = 0.0f;
+            for (int i = k; i < c; ++i) { a_n = MAX(a_n, s[ids[i]]); }
+            fprintf(stderr, "[cascade] down margin: k-th %.7g  next %.7g  rel %.3g\n",
+                    (double) a_k, (double) a_n, (double) (a_k - a_n) / (double) a_k);
+        }
+        std::vector<float> tk((size_t) k), ta((size_t) k);
+        for (int w = 0; w < k; ++w) {
+            tk[w] = idx[ids[w]];
+            ta[w] = act[ids[w]];
+        }
+        cascade_order_by_block(tk.data(), ta.data(), (int) k, (int) (F/32), idx, act);
+    }
+    if (ith == 0) {
+        const double t_end = (double) std::chrono::duration<double, std::micro>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        cascade_perf(0, t_end - t_op0);
+        if (getenv("LLAMA_CASCADE_PERF2")) {
+            fprintf(stderr, "[cascade] up phases: select %.1f us, dots %.1f us\n",
+                    t_sel - t_op0, t_end - t_sel);
+        }
+    }
+}
+
+// ggml_compute_forward_cascade_down
+//
+// LFM3 cascade FFN, stage 2: y[o] = sum_{j<k} sel[2][j] * w_down[o, sel[1][j]].
+// w_down is [n_ff, n_embd] (one contiguous row per output), so a unit's element in an output row
+// sits inside a quantization block that is shared by neighbouring units: blocks are dequantized at
+// most once per row while walking the ascending index list.
+void ggml_compute_forward_cascade_down(const struct ggml_compute_params * params,
+                                        struct ggml_tensor * dst) {
+    const struct ggml_tensor * sel = dst->src[0];
+    const struct ggml_tensor * w   = dst->src[1];
+
+    const int     k = ggml_get_op_params_i32(dst, 0);
+    const int64_t D = w->ne[1];
+    const int64_t F = w->ne[0];
+
+    const float * si = (const float *) ((const char *) sel->data +     sel->nb[1]);
+    const float * sa = (const float *) ((const char *) sel->data + 2 * sel->nb[1]);
+    float * y = (float *) dst->data;
+
+    const int nth = params->nth;
+    const int ith = params->ith;
+    const double t_op0 = ith == 0 ? (double) std::chrono::duration<double, std::micro>(
+        std::chrono::steady_clock::now().time_since_epoch()).count() : 0.0;
+
+    // fast path: unit-major Q8_0 repack, 128-output lines (one cache line per (unit, chunk)):
+    //   wt[chunk][unit][128] int8, st[chunk][block][128] f32 (the original per-block scales)
+    // Activations are quantized to int16 once; a unit-chunk then costs ~28 NEON ops (widening
+    // multiply-accumulate in int32) plus one scale multiply per 32-unit block. Outputs are split
+    // across threads, so there is no cross-thread reduce. Each 128-byte line is consumed as two
+    // 64-output passes to keep the accumulator within 16 NEON registers.
+    {
+        const struct ggml_tensor * wt = dst->src[2];
+        const struct ggml_tensor * st = dst->src[3];
+        if (wt != nullptr && st != nullptr) {
+            const int8_t * Wt = (const int8_t *) wt->data;
+            const float  * St = (const float  *) st->data;
+            const int64_t  n_chunk = D/128;
+
+            float amax = 0.0f;
+            for (int j = 0; j < k; ++j) {
+                const float av = fabsf(sa[j]);
+                amax = av > amax ? av : amax;
+            }
+            const float as = amax > 0.0f ? amax/32767.0f : 1.0f;
+            // quantize the activations once per op, not once per (unit, chunk): the division and
+            // rounding below are otherwise repeated for every output chunk
+            std::vector<int16_t> aq((size_t) k);
+            for (int j = 0; j < k; ++j) {
+                aq[j] = (int16_t) lrintf(sa[j]/as);
+            }
+
+            for (int64_t ch = ith; ch < n_chunk; ch += nth) {
+                const int8_t * Wc = Wt + (size_t) ch * F * 128;
+                const float  * Sc = St + (size_t) ch * (F/32) * 128;
+                float * yc = y + ch*128;
+                float Y[128];
+                for (int q = 0; q < 128; ++q) {
+                    Y[q] = 0.0f;
+                }
+                int n = 0;
+                while (n < k) {
+                    const int jb = ((int) si[n]) >> 5;
+                    int n_end = n;
+                    while (n_end < k && (((int) si[n_end]) >> 5) == jb) {
+                        ++n_end;
+                    }
+                    const float * ssc = Sc + (size_t) jb*128;
+#if defined(__ARM_NEON)
+                    for (int half = 0; half < 2; ++half) {
+                        int32x4_t P[16];
+                        for (int v = 0; v < 16; ++v) {
+                            P[v] = vdupq_n_s32(0);
+                        }
+                        for (int m = n; m < n_end; ++m) {
+                            const int8_t * wr = Wc + (size_t) ((int) si[m]) * 128 + half*64;
+                            if (half == 0 && m + 2 < n_end) {
+                                __builtin_prefetch(Wc + (size_t) ((int) si[m + 2]) * 128, 0, 1);
+                            }
+                            const int16_t  a16 = aq[m];
+                            for (int q = 0; q < 4; ++q) {
+                                const int8x16_t b = vld1q_s8(wr + 16*q);
+                                const int16x8_t lo = vmovl_s8(vget_low_s8(b));
+                                const int16x8_t hi = vmovl_high_s8(b);
+                                P[4*q + 0] = vmlal_n_s16     (P[4*q + 0], vget_low_s16(lo), a16);
+                                P[4*q + 1] = vmlal_high_n_s16(P[4*q + 1], lo,               a16);
+                                P[4*q + 2] = vmlal_n_s16     (P[4*q + 2], vget_low_s16(hi), a16);
+                                P[4*q + 3] = vmlal_high_n_s16(P[4*q + 3], hi,               a16);
+                            }
+                        }
+                        for (int v = 0; v < 16; ++v) {
+                            float32x4_t yv = vld1q_f32(Y + half*64 + 4*v);
+                            yv = vmlaq_f32(yv, vcvtq_f32_s32(P[v]), vld1q_f32(ssc + half*64 + 4*v));
+                            vst1q_f32(Y + half*64 + 4*v, yv);
+                        }
+                    }
+#elif defined(__AVX2__)
+                    for (int half = 0; half < 2; ++half) {
+                        __m256i P[8];                      // 8 x 8 int32 = 64 outputs
+                        for (int v = 0; v < 8; ++v) {
+                            P[v] = _mm256_setzero_si256();
+                        }
+                        for (int m = n; m < n_end; ++m) {
+                            const int8_t * wr = Wc + (size_t) ((int) si[m]) * 128 + half*64;
+                            const __m256i av = _mm256_set1_epi32((int) aq[m]);
+                            for (int q = 0; q < 4; ++q) {
+                                const __m128i raw = _mm_loadu_si128((const __m128i *) (wr + 16*q));
+                                const __m256i lo = _mm256_cvtepi8_epi32(raw);
+                                const __m256i hi = _mm256_cvtepi8_epi32(_mm_srli_si128(raw, 8));
+                                P[2*q + 0] = _mm256_add_epi32(P[2*q + 0], _mm256_mullo_epi32(av, lo));
+                                P[2*q + 1] = _mm256_add_epi32(P[2*q + 1], _mm256_mullo_epi32(av, hi));
+                            }
+                        }
+                        for (int v = 0; v < 8; ++v) {
+                            __m256 yv = _mm256_loadu_ps(Y + half*64 + 8*v);
+                            yv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(P[v]),
+                                                 _mm256_loadu_ps(ssc + half*64 + 8*v), yv);
+                            _mm256_storeu_ps(Y + half*64 + 8*v, yv);
+                        }
+                    }
+#else
+                    for (int half = 0; half < 2; ++half) {
+                        float P[64];
+                        for (int q = 0; q < 64; ++q) {
+                            P[q] = 0.0f;
+                        }
+                        for (int m = n; m < n_end; ++m) {
+                            const int8_t * wr = Wc + (size_t) ((int) si[m]) * 128 + half*64;
+                            if (half == 0 && m + 2 < n_end) {
+                                __builtin_prefetch(Wc + (size_t) ((int) si[m + 2]) * 128, 0, 1);
+                            }
+                            const float aj = sa[m];
+                            for (int q = 0; q < 64; ++q) {
+                                P[q] += aj * (float) wr[q];
+                            }
+                        }
+                        for (int q = 0; q < 64; ++q) {
+                            Y[half*64 + q] += P[q] * ssc[half*64 + q];
+                        }
+                    }
+#endif
+                    n = n_end;
+                }
+                for (int q = 0; q < 128; ++q) {
+                    yc[q] = Y[q]*as;
+                }
+            }
+            ggml_barrier(params->threadpool);   // time the op's real completion, not thread 0's
+            if (ith == 0) {
+                cascade_perf(1, (double) std::chrono::duration<double, std::micro>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count() - t_op0);
+            }
+            return;
+        }
+    }
+
+    // fallback: read w_down in its stored [n_ff, n_embd] layout
+    float blk[256];
+    const int64_t bs = ggml_blck_size(w->type);
+    const int64_t ts = ggml_type_size(w->type);
+    ggml_to_float_t const deq = ggml_get_type_traits(w->type)->to_float;
+    const int64_t per = (D + nth - 1)/nth;
+    const int64_t o0 = per*ith, o1 = MIN(o0 + per, D);
+
+    for (int64_t o = o0; o < o1; ++o) {
+        const char * row = (const char *) w->data + o*w->nb[1];
+        float a0 = 0.0f, a1 = 0.0f;
+        int64_t cur = -1;
+        for (int j = 0; j < k; ++j) {
+            const int64_t u = (int64_t) si[j];
+            const int64_t b = u/bs;
+            if (b != cur) {
+                cur = b;
+                deq(row + b*ts, blk, bs);
+            }
+            if (j & 1) { a1 += sa[j]*blk[u - b*bs]; } else { a0 += sa[j]*blk[u - b*bs]; }
+        }
+        y[o] = a0 + a1;
+    }
+    if (ith == 0) {
+        cascade_perf(1, (double) std::chrono::duration<double, std::micro>(
+            std::chrono::steady_clock::now().time_since_epoch()).count() - t_op0);
     }
 }
 

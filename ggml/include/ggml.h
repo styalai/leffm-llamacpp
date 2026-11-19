@@ -431,6 +431,9 @@ extern "C" {
 
         GGML_OP_SLEEP,
 
+        GGML_OP_CASCADE_UP,
+        GGML_OP_CASCADE_DOWN,
+
         GGML_OP_COUNT,
     };
 
@@ -2225,6 +2228,32 @@ extern "C" {
     GGML_API struct ggml_tensor * ggml_top_k(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
+            int                   k);
+
+    // Cascade FFN, stage 1 (LFM3): keep the exact top-c of |silu(g)|, gather-dot those rows of `w_up`,
+    // then keep the exact top-k of |silu(g)*u|. dst is [F, 3] f32; on output rows 1 and 2 hold the
+    // first k entries: unit indices and their activations.
+    // `w_up_t` is the optional f16 unit-major repack of w_up (GPU backends only; pass NULL otherwise)
+    GGML_API struct ggml_tensor * ggml_cascade_up(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * w_up,
+            struct ggml_tensor  * w_up_t,
+            struct ggml_tensor  * w_up_s,
+            int                   c,
+            int                   k);
+
+    // Cascade FFN, stage 2: dst[o] = sum_{j<k} sel[2][j] * w_down[o, sel[1][j]].
+    // `w_t` / `s_t` are the optional unit-major repack of a Q8_0 `w_down` (int8 [64, F, D/64] and
+    // f32 [64, F/32, D/64]); when present the down becomes a chunked axpy over units with no
+    // per-block dequant and no cross-thread reduce. Pass NULL to use `w_down` directly.
+    GGML_API struct ggml_tensor * ggml_cascade_down(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * sel,
+            struct ggml_tensor  * w_down,
+            struct ggml_tensor  * w_t,
+            struct ggml_tensor  * s_t,
             int                   k);
 
     GGML_API struct ggml_tensor * ggml_arange(

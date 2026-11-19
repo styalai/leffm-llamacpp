@@ -201,8 +201,26 @@ llama_model_lfm3::graph<decision>::graph(const llm_graph_params & params) :
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
-    cur = build_lora_mm(model.output, cur, model.output_s);
-    cb(cur, "result_output", -1);
+    {
+        struct ggml_tensor * w_trim = nullptr, * idx_t = nullptr, * base_t = nullptr;
+        model.get_cascade_head(&w_trim, &idx_t, &base_t);
+        if (w_trim != nullptr) {
+            // vocabulary cut: the head runs on the kept ids only, then scatters into the full
+            // logits so sampling and detokenization are untouched
+            struct ggml_tensor * lt = ggml_mul_mat(ctx0, w_trim, cur);          // [V', T]
+            cb(lt, "result_output_trim", -1);
+            // set_rows scatters along ne1, so work transposed: [T, V'] into a [T, n_vocab] base
+            struct ggml_tensor * lt_t = ggml_cont(ctx0, ggml_transpose(ctx0, lt));
+            struct ggml_tensor * fill_t = ggml_repeat(ctx0, base_t,
+                    ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, cur->ne[1], model.vocab.n_tokens()));
+            struct ggml_tensor * out_t = ggml_set_rows(ctx0, fill_t, lt_t, idx_t);   // [T, n_vocab]
+            cur = ggml_cont(ctx0, ggml_transpose(ctx0, out_t));                     // [n_vocab, T]
+            cb(cur, "result_output", -1);
+        } else {
+            cur = build_lora_mm(model.output, cur, model.output_s);
+            cb(cur, "result_output", -1);
+        }
+    }
 
     res->t_logits = cur;
 }

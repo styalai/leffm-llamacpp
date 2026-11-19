@@ -8,6 +8,7 @@
 #include "llama-vocab.h"
 
 #include <map>
+#include <mutex>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -991,6 +992,29 @@ struct llama_model {
 
     // for quantize-stats only
     std::vector<std::pair<std::string, struct ggml_tensor *>> tensors_by_name;
+
+    // LFM3 cascade FFN: lazily built unit-major repack of ffn_down (Q8_0 only, lossless)
+    void get_cascade_repack(int il, struct ggml_tensor ** w_t, struct ggml_tensor ** s_t) const;
+    void get_cascade_head(struct ggml_tensor ** w_out, struct ggml_tensor ** idx_out,
+                          struct ggml_tensor ** base_out) const;
+    struct ggml_tensor * get_cascade_up_w(int il) const;
+    struct ggml_tensor * get_cascade_up_s(int il) const;
+    mutable std::mutex cascade_mutex;
+    mutable std::vector<struct ggml_context *>        cascade_ctxs;
+    mutable std::vector<struct ggml_backend_buffer *> cascade_bufs;
+    mutable std::vector<struct ggml_tensor *>         cascade_wt;
+    mutable std::vector<struct ggml_tensor *>         cascade_st;
+    mutable std::vector<struct ggml_tensor *>         cascade_wu;   // int8 unit-major ffn_up
+    mutable std::vector<struct ggml_tensor *>         cascade_wus;  // its per-block scales
+    mutable bool cascade_repack_done = false;
+
+    // LFM3 cascade vocabulary cut: the head is evaluated on the kept ids only and scattered into
+    // the full logits. Built after the weights are loaded (LLAMA_CASCADE_VOCAB = one id per line).
+    void load_tensors_cascade();
+    mutable bool cascade_head_done = false;
+    mutable struct ggml_tensor * cascade_head_w    = nullptr;
+    mutable struct ggml_tensor * cascade_head_idx  = nullptr;
+    mutable struct ggml_tensor * cascade_head_base = nullptr;
 
     // for keeping track of associated LoRA adapters
     std::unordered_set<llama_adapter_lora *> loras;

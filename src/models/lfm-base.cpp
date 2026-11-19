@@ -92,8 +92,49 @@ ggml_tensor * llm_build_lfm_base::build_lfm_shortconv(ggml_tensor * cur,
     return y;
 }
 
+// Cascade FFN (opt-in): LLAMA_CASCADE="c,k" replaces the dense FFN on single-token steps.
+// gate matmul stays stock; the two custom ops do exact top-k selection and the gathered projections.
+ggml_tensor * llm_build_lfm_base::build_lfm_cascade_ffn(ggml_tensor * cur, int il, int c, int k) {
+    struct ggml_tensor * g = build_lora_mm(model.layers[il].ffn_gate, cur);
+    cb(g, "model.layers.{}.ffn_gate", il);
+
+    struct ggml_tensor * wu  = model.get_cascade_up_w(il);
+    struct ggml_tensor * wus = model.get_cascade_up_s(il);
+    struct ggml_tensor * sel = ggml_cascade_up(ctx0, g, cur, model.layers[il].ffn_up, wu, wus, c, k);
+    cb(sel, "model.layers.{}.ffn_cascade_up", il);
+
+    struct ggml_tensor * w_t = nullptr;
+    struct ggml_tensor * s_t = nullptr;
+    model.get_cascade_repack(il, &w_t, &s_t);
+    struct ggml_tensor * y = ggml_cascade_down(ctx0, sel, model.layers[il].ffn_down, w_t, s_t, k);
+    cb(y, "model.layers.{}.ffn_cascade_down", il);
+    return y;
+}
+
+static bool lfm_cascade_cfg(int & c, int & k) {
+    static int sc = -1, sk = -1;
+    if (sc < 0) {
+        sc = 0; sk = 0;
+        const char * e = getenv("LLAMA_CASCADE");
+        if (e != nullptr) {
+            int cc = 0, kk = 0;
+            if (sscanf(e, "%d,%d", &cc, &kk) == 2 && kk > 0 && cc >= kk) {
+                sc = cc; sk = kk;
+            } else {
+                fprintf(stderr, "%s: ignoring LLAMA_CASCADE=%s (want \"c,k\" with c >= k > 0)\n", __func__, e);
+            }
+        }
+    }
+    c = sc; k = sk;
+    return sc > 0;
+}
+
 ggml_tensor * llm_build_lfm_base::build_lfm_dense_ffn(ggml_tensor * cur,
                                                       int il) {
+    int cascade_c = 0, cascade_k = 0;
+    if (cur->ne[1] == 1 && cur->ne[2] == 1 && cur->ne[3] == 1 && lfm_cascade_cfg(cascade_c, cascade_k)) {
+        return build_lfm_cascade_ffn(cur, il, cascade_c, cascade_k);
+    }
     GGML_ASSERT(!model.layers[il].ffn_up_b);
     GGML_ASSERT(!model.layers[il].ffn_gate_b);
     GGML_ASSERT(!model.layers[il].ffn_down_b);

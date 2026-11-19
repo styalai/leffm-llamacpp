@@ -110,6 +110,7 @@ int ggml_metal_pipeline_max_theads_per_threadgroup(struct ggml_metal_pipeline_wi
 //   X(suffix, name): name is both the kernels/<name>.metal basename and the
 //   ggml_metallib_<name>_{start,end} embed-symbol stem.
 #define GGML_METAL_LIBS \
+    X(CASCADE,         cascade)        \
     X(FA_AUX,          fa_aux)         \
     X(FA_F16,          fa_f16)         \
     X(FA_F32,          fa_f32)         \
@@ -2018,6 +2019,11 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                         return false;
                 };
             }
+        case GGML_OP_CASCADE_UP:
+            return op->src[3] != NULL && op->src[3]->type == GGML_TYPE_I8 && op->src[4] != NULL;
+        case GGML_OP_CASCADE_DOWN:
+            return op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[2] != NULL && op->src[3] != NULL;   // repacked unit-major weights
         case GGML_OP_DIAG:
             return op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_OPT_STEP_ADAMW:

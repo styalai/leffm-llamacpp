@@ -429,6 +429,12 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
         return true;
     }
 
+    // the cascade ops walk host memory directly, so they are supported on any host-resident src
+    // (the extra-buffer delegation below would hand them to BLAS, which only knows MUL_MAT)
+    if (op->op == GGML_OP_CASCADE_UP || op->op == GGML_OP_CASCADE_DOWN) {
+        return true;
+    }
+
     // check extra buffer types
     // note: only the first sources are checked for extra buffer types to reduce overhead, increase if necessary
     for (int i = 0; i < 4; i++) {

@@ -1457,4 +1457,25 @@ typedef struct {
     int64_t ne;
 } ggml_metal_kargs_silu_back;
 
+typedef struct {
+    int32_t F;      // number of units
+    int32_t k;      // selected units
+    int32_t nch;    // output chunks (n_embd / 128)
+    int32_t ablate; // 1 = skip (timing ablation)
+} ggml_metal_kargs_cascade_down;
+
+typedef struct {
+    int32_t F;      // number of units
+    int32_t c;      // count to keep
+    int32_t stage;  // 0: score from g, 1: score from act
+    int32_t ablate; // 1 = skip (timing ablation)
+} ggml_metal_kargs_cascade_sel;
+
+typedef struct {
+    int32_t F;      // number of units
+    int32_t D;      // hidden size
+    int32_t NB;     // D / 32 (scale blocks per unit)
+    int32_t ablate; // 1 = skip (timing ablation)
+} ggml_metal_kargs_cascade_up;
+
 #endif // GGML_METAL_IMPL

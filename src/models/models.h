@@ -83,6 +83,7 @@ struct llm_build_lfm_base : public llm_graph_context {
     ggml_tensor * build_lfm_shortconv(ggml_tensor * cur,
                                       int il);
 
+    ggml_tensor * build_lfm_cascade_ffn(ggml_tensor * cur, int il, int c, int k);
     ggml_tensor * build_lfm_dense_ffn(ggml_tensor * cur,
                                       int il);
 

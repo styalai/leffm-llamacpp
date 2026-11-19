@@ -324,6 +324,14 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_silu_back(ctx, idx);
             } break;
+        case GGML_OP_CASCADE_UP:
+            {
+                n_fuse = ggml_metal_op_cascade_up(ctx, idx);
+            } break;
+        case GGML_OP_CASCADE_DOWN:
+            {
+                n_fuse = ggml_metal_op_cascade_down(ctx, idx);
+            } break;
         case GGML_OP_GLU:
             {
                 n_fuse = ggml_metal_op_glu(ctx, idx);
@@ -4487,6 +4495,137 @@ int ggml_metal_op_bin(ggml_metal_op_t ctx, int idx) {
     }
 
     return n_fuse;
+}
+
+static int cascade_ablate(void) {
+    // 1 = all stages, 2 = selection only, 4 = up only, 8 = down only (timing ablation)
+    static int mode = -1;
+    if (mode < 0) {
+        const char * e = getenv("LLAMA_CASCADE_ABLATE");
+        mode = 0;
+        if (e != nullptr) {
+            if (strcmp(e, "empty") == 0)     mode = 15;
+            else if (strcmp(e, "nosel") == 0) mode = 3;
+            else if (strcmp(e, "noup") == 0)  mode = 5;
+            else if (strcmp(e, "nodown") == 0) mode = 9;
+        }
+    }
+    return mode;
+}
+
+int ggml_metal_op_cascade_up(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    auto pipe_sel = ggml_metal_library_get_pipeline_cascade_sel(lib);
+    auto pipe_up  = ggml_metal_library_get_pipeline_cascade_up(lib);
+
+    ggml_tensor * sel = op;           // rows: 0 act, 1 mask1, 2 mask_final
+    ggml_tensor * g   = op->src[0];   // [F] gate pre-activations
+    ggml_tensor * x   = op->src[1];   // hidden state [D]
+    ggml_tensor * wu  = op->src[3];   // int8 unit-major ffn_up (repacked)
+    ggml_tensor * wus = op->src[4];   // its per-32-block scales
+
+    const int64_t F = g->ne[0];
+    const int64_t D = x->ne[0];
+    const int64_t c = ggml_get_op_params_i32(op, 0);
+    const int64_t k = ggml_get_op_params_i32(op, 1);
+
+    ggml_metal_buffer_id bid_sel  = ggml_metal_get_buffer_id(sel);
+    ggml_metal_buffer_id bid_act  = { bid_sel.metal, bid_sel.offs              };
+    ggml_metal_buffer_id bid_m1   = { bid_sel.metal, bid_sel.offs + sel->nb[1] };
+    ggml_metal_buffer_id bid_mf   = { bid_sel.metal, bid_sel.offs + 2*sel->nb[1] };
+
+    const int ntg_sel = 512;
+    const int ntg_up  = 128;
+
+    // selection, stage 0: scores from g -> mask1
+    {
+        ggml_metal_kargs_cascade_sel args = { (int32_t) F, (int32_t) c, 0, (cascade_ablate() & 1) || (cascade_ablate() & 2) };
+        ggml_metal_encoder_set_pipeline(enc, pipe_sel);
+        ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(g), 1);
+        ggml_metal_encoder_set_buffer  (enc, bid_act, 2);
+        ggml_metal_encoder_set_buffer  (enc, bid_m1,  3);
+        ggml_metal_encoder_set_buffer  (enc, bid_m1,  4);
+        ggml_metal_encoder_dispatch_threadgroups(enc, 1, 1, 1, ntg_sel, 1, 1);
+    }
+    ggml_metal_encoder_memory_barrier(enc);
+
+    // gathered up dots for the candidates
+    {
+        ggml_metal_kargs_cascade_up args = { (int32_t) F, (int32_t) D, (int32_t) (D/32), (cascade_ablate() & 4) != 0 };
+        const int per_tg = ntg_up / 32;
+        ggml_metal_encoder_set_pipeline(enc, pipe_up);
+        ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+        // indices follow the MSL declaration order: args(0), wu(1), wus(2), x(3), g(4), mask(5), act(6)
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(wu),  1);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(wus), 2);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(x),   3);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(g),   4);
+        ggml_metal_encoder_set_buffer  (enc, bid_m1,  5);
+        ggml_metal_encoder_set_buffer  (enc, bid_act, 6);
+        ggml_metal_encoder_dispatch_threadgroups(enc, (int) ((F + per_tg - 1)/per_tg), 1, 1, ntg_up, 1, 1);
+    }
+    ggml_metal_encoder_memory_barrier(enc);
+
+    // selection, stage 1: |act| among the candidates -> final mask
+    {
+        ggml_metal_kargs_cascade_sel args = { (int32_t) F, (int32_t) k, 1, (cascade_ablate() & 1) || (cascade_ablate() & 2) };
+        ggml_metal_encoder_set_pipeline(enc, pipe_sel);
+        ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(g), 1);
+        ggml_metal_encoder_set_buffer  (enc, bid_act, 2);
+        ggml_metal_encoder_set_buffer  (enc, bid_m1,  3);
+        ggml_metal_encoder_set_buffer  (enc, bid_mf,  4);   // float list for stage 1
+        ggml_metal_encoder_dispatch_threadgroups(enc, 1, 1, 1, ntg_sel, 1, 1);
+    }
+
+    return 1;
+}
+
+int ggml_metal_op_cascade_down(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    auto pipeline = ggml_metal_library_get_pipeline_cascade_down(lib, op);
+
+    ggml_tensor * sel  = op->src[0];   // rows: 0 scores, 1 unit ids (f32), 2 activations
+    ggml_tensor * wt   = op->src[2];
+    ggml_tensor * st   = op->src[3];
+
+    const int64_t F   = sel->ne[0];
+    const int64_t nch = op->ne[0] / 128;
+    const int64_t k   = ggml_get_op_params_i32(op, 0);
+
+    ggml_metal_kargs_cascade_down args = {
+        /*.F   =*/ (int32_t) F,
+        /*.k   =*/ (int32_t) k,
+        /*.nch =*/ (int32_t) nch,
+        /*.ablate =*/ (int32_t) ((cascade_ablate() & 8) != 0),
+    };
+    (void) op->src[1];   // w_down (unused: the repacked wt/st replace it)
+
+    ggml_metal_buffer_id bid_sel  = ggml_metal_get_buffer_id(sel);
+    ggml_metal_buffer_id bid_act  = { bid_sel.metal, bid_sel.offs              };
+    ggml_metal_buffer_id bid_list = { bid_sel.metal, bid_sel.offs + 2*sel->nb[1] };  // ascending ids
+
+    int arg_idx{0};
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), arg_idx++);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(wt), arg_idx++);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(st), arg_idx++);
+    ggml_metal_encoder_set_buffer  (enc, bid_act,  arg_idx++);
+    ggml_metal_encoder_set_buffer  (enc, bid_list, arg_idx++);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op), arg_idx++);
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, nch, 1, 1, 128, 1, 1);
+
+    return 1;
 }
 
 int ggml_metal_op_silu_back(ggml_metal_op_t ctx, int idx) {
