@@ -1462,6 +1462,7 @@ typedef struct {
     int32_t k;      // selected units
     int32_t nch;    // output chunks (n_embd / 128)
     int32_t ablate; // 1 = skip (timing ablation)
+    int32_t prefix; // 1 = ignore the list and read units 0..k-1 (speed-only granularity probe)
 } ggml_metal_kargs_cascade_down;
 
 typedef struct {

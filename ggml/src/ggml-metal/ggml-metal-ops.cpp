@@ -4607,6 +4607,7 @@ int ggml_metal_op_cascade_down(ggml_metal_op_t ctx, int idx) {
         /*.k   =*/ (int32_t) k,
         /*.nch =*/ (int32_t) nch,
         /*.ablate =*/ (int32_t) ((cascade_ablate() & 8) != 0),
+        /*.prefix =*/ (int32_t) (getenv("LLAMA_CASCADE_DOWN_PREFIX") != nullptr),
     };
     (void) op->src[1];   // w_down (unused: the repacked wt/st replace it)
 
@@ -4623,7 +4624,7 @@ int ggml_metal_op_cascade_down(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer  (enc, bid_list, arg_idx++);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op), arg_idx++);
 
-    ggml_metal_encoder_dispatch_threadgroups(enc, nch, 1, 1, 128, 1, 1);
+    ggml_metal_encoder_dispatch_threadgroups(enc, nch, 1, 1, 512, 1, 1);
 
     return 1;
 }

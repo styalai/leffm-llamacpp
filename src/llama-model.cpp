@@ -1515,9 +1515,12 @@ void llama_model::get_cascade_repack(int il, struct ggml_tensor ** w_t, struct g
         }
 
         // the unit-major up repack is read by the Metal kernels only: the CPU up op gathers from
-        // the original ffn_up, so a host-resident model must not pay for it
-        const bool with_up = ggml_backend_dev_type(ggml_backend_buft_get_device(buft)) ==
-                             GGML_BACKEND_DEVICE_TYPE_GPU;
+        // the original ffn_up, so a host-resident model must not pay for it.
+        // note: ggml_backend_buft_get_device is NULL for a plain host buft and
+        // ggml_backend_dev_type(NULL) asserts, so guard it.
+        const ggml_backend_dev_t buft_dev = ggml_backend_buft_get_device(buft);
+        const bool with_up = buft_dev != nullptr &&
+                             ggml_backend_dev_type(buft_dev) == GGML_BACKEND_DEVICE_TYPE_GPU;
 
         size_t total = 0;
         for (int i = 0; i < n_layer && ok; ++i) {

@@ -40,6 +40,11 @@ kernel void kernel_cascade_down(
     const int n0 = sg*per_sg;
     const int n1 = min(n0 + per_sg, K);
 
+    // LLAMA_CASCADE_DOWN_PREFIX: read units 0..K-1 instead of the selected list. The result is
+    // wrong on purpose -- it turns every chunk into a sequential stream, which isolates "the
+    // gathered access granularity is the limiter" from every other explanation.
+    const bool prefix = args.prefix != 0;
+
     threadgroup float4 part[32][32];
 
     float4 acc  = float4(0.0f);
@@ -52,8 +57,8 @@ kernel void kernel_cascade_down(
             // eight ids: two vector loads for the ids, eight independent line loads in flight
             const float4 ia = *(device const float4 *) (list + n);
             const float4 ib = *(device const float4 *) (list + n + 4);
-            const int j0 = (int) ia.x;
-            const int j7 = (int) ib.w;
+            const int j0 = prefix ? n     : (int) ia.x;
+            const int j7 = prefix ? n + 7 : (int) ib.w;
             const int b8 = j0 >> 5;
             if (b8 == (j7 >> 5)) {
                 if (b8 != cur_b) {
@@ -63,8 +68,14 @@ kernel void kernel_cascade_down(
                     cur_b = b8;
                     ablk = float4(0.0f);
                 }
-                const int j[8] = { j0, (int) ia.y, (int) ia.z, (int) ia.w,
-                                   (int) ib.x, (int) ib.y, (int) ib.z, j7 };
+                const int j[8] = { j0,
+                                   prefix ? n + 1 : (int) ia.y,
+                                   prefix ? n + 2 : (int) ia.z,
+                                   prefix ? n + 3 : (int) ia.w,
+                                   prefix ? n + 4 : (int) ib.x,
+                                   prefix ? n + 5 : (int) ib.y,
+                                   prefix ? n + 6 : (int) ib.z,
+                                   j7 };
                 char4 w[8];
                 for (int u = 0; u < 8; ++u) {
                     w[u] = W[(size_t) j[u]*32 + lane];
