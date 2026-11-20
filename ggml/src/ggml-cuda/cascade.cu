@@ -181,7 +181,10 @@ __global__ void cascade_up_kernel(
     }
 }
 
-// one block per 128 outputs x one slice of the unit list; partials summed by cascade_down_reduce
+// one block per 128 outputs x one slice of the unit list; partials summed by cascade_down_reduce.
+// each thread owns 4 consecutive outputs and reads them as one 32-bit load, so the gather issues a
+// quarter of the load instructions the byte-at-a-time version did (that version measured 61 GB/s
+// against the up projection's 228 GB/s on an L4).
 __global__ void cascade_down_kernel(
         const char  * __restrict__ wt,     // [F, D] int8, unit-major
         const __half* __restrict__ st,     // [F/32, D] f16 scales
@@ -192,37 +195,58 @@ __global__ void cascade_down_kernel(
         const int F,
         const int k,
         const int nslice) {
-    const int chunk = 128;
-    const int nch   = D / chunk;
+    const int vec   = 4;
+    const int chunk = 128*vec;
     const int sl    = blockIdx.x % nslice;
     const int ch    = blockIdx.x / nslice;
-    const int o     = ch*chunk + threadIdx.x;      // output index
+    const int o     = ch*chunk + threadIdx.x*vec;
     if (o >= D) {
         return;
     }
     const int per = (k + nslice - 1) / nslice;
     const int n0  = sl*per;
     const int n1  = min(n0 + per, k);
+    const bool full = o + vec <= D;
 
-    float acc = 0.0f;
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float abl[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     int cur_b = -1;
-    float abl = 0.0f;
     for (int n = n0; n < n1; ++n) {
-        const int u = min(max((int) list[n], 0), (int) F - 1);
+        const int u = min(max((int) list[n], 0), F - 1);
         const int b = u >> 5;
         if (b != cur_b) {
             if (cur_b >= 0) {
-                acc += abl * __half2float(st[(size_t) cur_b*D + o]);
+                const __half * sp = st + (size_t) cur_b*D + o;
+                for (int j = 0; j < vec && o + j < D; ++j) {
+                    acc[j] += abl[j] * __half2float(sp[j]);
+                }
             }
             cur_b = b;
-            abl = 0.0f;
+            abl[0] = abl[1] = abl[2] = abl[3] = 0.0f;
         }
-        abl += act[u] * (float) wt[(size_t) u*D + o];
+        const float a = act[u];
+        const char * row = wt + (size_t) u*D + o;
+        if (full) {
+            const int v = *(const int *) row;
+            abl[0] += a * (float) (signed char) ( v        & 0xFF);
+            abl[1] += a * (float) (signed char) ((v >>  8) & 0xFF);
+            abl[2] += a * (float) (signed char) ((v >> 16) & 0xFF);
+            abl[3] += a * (float) (signed char) ((v >> 24) & 0xFF);
+        } else {
+            for (int j = 0; j < vec && o + j < D; ++j) {
+                abl[j] += a * (float) row[j];
+            }
+        }
     }
     if (cur_b >= 0) {
-        acc += abl * __half2float(st[(size_t) cur_b*D + o]);
+        const __half * sp = st + (size_t) cur_b*D + o;
+        for (int j = 0; j < vec && o + j < D; ++j) {
+            acc[j] += abl[j] * __half2float(sp[j]);
+        }
     }
-    part[(size_t) sl*D + o] = acc;
+    for (int j = 0; j < vec && o + j < D; ++j) {
+        part[(size_t) sl*D + o + j] = acc[j];
+    }
 }
 
 __global__ void cascade_down_reduce_kernel(
@@ -259,6 +283,39 @@ __global__ void cascade_expand_kernel(
     out[i] = (p < Vt) ? lt[p + (size_t) t*Vt] : ninf[0];
 }
 
+// CASCADE_CUDA_TIME=1 times each launch with CUDA events and prints the totals at exit. The skip
+// ablation cannot separate a stage from the weight traffic it removes; this can.
+struct ct_timers {
+    bool on;
+    cudaEvent_t e0, e1;
+    double sel0 = 0, up = 0, sel1 = 0, down = 0, reduce = 0, expand = 0;
+    long n_sel0 = 0, n_up = 0, n_sel1 = 0, n_down = 0, n_reduce = 0, n_expand = 0;
+    ct_timers() {
+        const char * e = getenv("CASCADE_CUDA_TIME");
+        on = e != nullptr && e[0] == '1';
+        if (on) { cudaEventCreate(&e0); cudaEventCreate(&e1); }
+    }
+    ~ct_timers() {
+        if (!on) { return; }
+        cudaEventSynchronize(e1);
+        fprintf(stderr,
+                "CASCADE_CUDA_TIME sel0=%.1fms/%ld up=%.1fms/%ld sel1=%.1fms/%ld down=%.1fms/%ld "
+                "reduce=%.1fms/%ld expand=%.1fms/%ld\n",
+                sel0, n_sel0, up, n_up, sel1, n_sel1, down, n_down, reduce, n_reduce, expand, n_expand);
+    }
+    void start(cudaStream_t s) { if (on) { cudaEventRecord(e0, s); } }
+    void stop(cudaStream_t s, double & slot, long & cnt) {
+        if (!on) { return; }
+        cudaEventRecord(e1, s);
+        cudaEventSynchronize(e1);
+        float ms = 0.0f;
+        cudaEventElapsedTime(&ms, e0, e1);
+        slot += ms;
+        cnt  += 1;
+    }
+};
+static ct_timers g_ct;
+
 // CASCADE_CUDA_SKIP=sel0|up|sel1|down|reduce disables one stage at a time, for bisecting a fault
 static bool cascade_skip(const char * what) {
     static const char * e = getenv("CASCADE_CUDA_SKIP");
@@ -286,20 +343,26 @@ void ggml_cuda_op_cascade_up(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
     cudaStream_t st = ctx.stream();
     const int shmem = (int) (F*sizeof(float));
 
+    g_ct.start(st);
     if (!cascade_skip("sel0"))
     cascade_sel_kernel<true><<<1, CASCADE_SEL_BLOCK, shmem, st>>>(
         (const float *) g->data, act, lsk, lst, F, c, F, c);
+    g_ct.stop(st, g_ct.sel0, g_ct.n_sel0);
     CUDA_CHECK(cudaGetLastError());
 
+    g_ct.start(st);
     if (!cascade_skip("up"))
     cascade_up_kernel<<<c, CASCADE_UP_BLOCK, 0, st>>>(
         (const char *) wu->data, (const __half *) wus->data,
         (const float *) x->data, (const float *) g->data, lst, act, D, F, c);
+    g_ct.stop(st, g_ct.up, g_ct.n_up);
     CUDA_CHECK(cudaGetLastError());
 
+    g_ct.start(st);
     if (!cascade_skip("sel1"))
     cascade_sel_kernel<false><<<1, CASCADE_SEL_BLOCK, (int) (c*sizeof(float)), st>>>(
         (const float *) g->data, act, lst, lsk, F, c, c, k);
+    g_ct.stop(st, g_ct.sel1, g_ct.n_sel1);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -318,15 +381,19 @@ void ggml_cuda_op_cascade_down(ggml_backend_cuda_context & ctx, ggml_tensor * ds
 
     cudaStream_t s = ctx.stream();
     const int F = (int) sel->ne[0];
+    g_ct.start(s);
     if (!cascade_skip("down"))
-    cascade_down_kernel<<<(D/128)*S, 128, 0, s>>>(
+    cascade_down_kernel<<<((D + 511)/512)*S, 128, 0, s>>>(
         (const char *) wt->data, (const __half *) st->data, list, act,
         (float *) sp->data, D, F, k, S);
+    g_ct.stop(s, g_ct.down, g_ct.n_down);
     CUDA_CHECK(cudaGetLastError());
 
+    g_ct.start(s);
     if (!cascade_skip("reduce"))
     cascade_down_reduce_kernel<<<(D + 255)/256, 256, 0, s>>>(
         (const float *) sp->data, (float *) dst->data, D, S);
+    g_ct.stop(s, g_ct.reduce, g_ct.n_reduce);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -339,8 +406,10 @@ void ggml_cuda_op_cascade_expand(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int T  = (int) dst->ne[1];
     const int Vt = (int) lt->ne[0];
 
+    g_ct.start(ctx.stream());
     cascade_expand_kernel<<<(V*T + 255)/256, 256, 0, ctx.stream()>>>(
         (const float *) lt->data, (const int *) inv->data, (const float *) ninf->data,
         (float *) dst->data, V, T, Vt);
+    g_ct.stop(ctx.stream(), g_ct.expand, g_ct.n_expand);
     CUDA_CHECK(cudaGetLastError());
 }
