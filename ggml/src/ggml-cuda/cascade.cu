@@ -144,6 +144,15 @@ __global__ void cascade_sel_kernel(
             list_out[pos++] = STAGE0 ? (float) t : (float) list_in[t];
         }
     }
+
+    // the full count of written entries is the last element of the inclusive scan
+    __syncthreads();
+    const int total = scr[nt - 1];
+    // pad with a valid unit id: a short list would otherwise leave uninitialised ids that the next
+    // stage reads as unit indices
+    for (int p = total + tid; p < target; p += nt) {
+        list_out[p] = STAGE0 ? 0.0f : (list_in[0] >= 0.0f ? list_in[0] : 0.0f);
+    }
 }
 
 // one block per candidate: dot of the unit's int8 row against x, with the per-32-block scales
@@ -160,7 +169,7 @@ __global__ void cascade_up_kernel(
     if (idx >= c) {
         return;
     }
-    const int u   = (int) list[idx];
+    const int u   = min(max((int) list[idx], 0), F - 1);
     const int NB  = D / 32;
     const int tid = threadIdx.x;
     const int nt  = blockDim.x;
@@ -207,6 +216,7 @@ __global__ void cascade_down_kernel(
         const float * __restrict__ act,    // [F]
         float       * __restrict__ part,   // [S, D]
         const int D,
+        const int F,
         const int k,
         const int nslice) {
     const int chunk = 128;
@@ -225,7 +235,7 @@ __global__ void cascade_down_kernel(
     int cur_b = -1;
     float abl = 0.0f;
     for (int n = n0; n < n1; ++n) {
-        const int u = (int) list[n];
+        const int u = min(max((int) list[n], 0), (int) F - 1);
         const int b = u >> 5;
         if (b != cur_b) {
             if (cur_b >= 0) {
@@ -325,9 +335,10 @@ void ggml_cuda_op_cascade_down(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     const float * list = (const float *) sel->data + 2*sel->ne[0];
 
     cudaStream_t s = ctx.stream();
+    const int F = (int) sel->ne[0];
     cascade_down_kernel<<<(D/128)*S, 128, 0, s>>>(
         (const char *) wt->data, (const __half *) st->data, list, act,
-        (float *) sp->data, D, k, S);
+        (float *) sp->data, D, F, k, S);
     CUDA_CHECK(cudaGetLastError());
 
     cascade_down_reduce_kernel<<<(D + 255)/256, 256, 0, s>>>(
