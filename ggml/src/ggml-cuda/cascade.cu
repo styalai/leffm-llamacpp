@@ -1,5 +1,8 @@
 #include "cascade.cuh"
 
+#include <cstdlib>
+#include <cstring>
+
 // LFM3 cascade FFN on CUDA. T = 1 only (the recipe is used on single-token steps).
 //
 //   CASCADE_UP      sel(g, top-c) -> gathered up dots -> sel(act, top-k within c)
