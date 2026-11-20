@@ -15,7 +15,7 @@
 
 #define CASCADE_SEL_BLOCK 1024
 #define CASCADE_SEL_MAX   8192   // scores held in shared memory (32 KB)
-#define CASCADE_UP_BLOCK  256
+#define CASCADE_UP_BLOCK  128
 #define CASCADE_DOWN_SLICES 16
 
 // exact top-`target` of a non-negative score array, compacted into an ascending list of unit ids.
@@ -143,7 +143,10 @@ __global__ void cascade_sel_kernel(
     }
 }
 
-// one block per candidate: dot of the unit's int8 row against x, with the per-32-block scales
+// one block per candidate: dot of the unit's int8 row against x, with the per-32-block scales.
+// each thread reads 16 consecutive weights as one 16-byte load (the row is 16-byte aligned, and 16
+// values never straddle a 32-value scale block), so the row is fetched in 128-byte transactions and
+// each thread keeps 16 bytes in flight instead of 4.
 __global__ void cascade_up_kernel(
         const char  * __restrict__ wu,     // [F, D] int8, unit-major
         const __half* __restrict__ wus,    // [F, D/32] f16 scales
@@ -168,17 +171,38 @@ __global__ void cascade_up_kernel(
     const char *   row = wu  + (size_t) u*D;
     const __half * wsr = wus + (size_t) u*NB;
 
+    const int vec    = 16;
+    const int stride = nt*vec;
     float acc = 0.0f;
-    // thread t owns the values [t*per, (t+1)*per); per is 8 for D = 2048 / 256 threads
-    const int per = D / nt;
-    for (int i = 0; i < per; i += 4) {
-        const int o = tid*per + i;
-        // 4 consecutive int8 values, all inside one 32-value block when per | 32
-        const int blk = o >> 5;
-        const float sc = __half2float(wsr[blk]);
+    for (int o = tid*vec; o < D; o += stride) {
+        const float sc = __half2float(wsr[o >> 5]);
         float p = 0.0f;
-        for (int j = 0; j < 4; ++j) {
-            p += x[o + j] * (float) row[o + j];
+        if (o + vec <= D) {
+            const int4   w = *(const int4   *) (row + o);
+            const float4 x0 = *(const float4 *) (x + o);
+            const float4 x1 = *(const float4 *) (x + o + 4);
+            const float4 x2 = *(const float4 *) (x + o + 8);
+            const float4 x3 = *(const float4 *) (x + o + 12);
+            p += x0.x*(float)(signed char)( w.x        & 0xFF);
+            p += x0.y*(float)(signed char)((w.x >>  8) & 0xFF);
+            p += x0.z*(float)(signed char)((w.x >> 16) & 0xFF);
+            p += x0.w*(float)(signed char)((w.x >> 24) & 0xFF);
+            p += x1.x*(float)(signed char)( w.y        & 0xFF);
+            p += x1.y*(float)(signed char)((w.y >>  8) & 0xFF);
+            p += x1.z*(float)(signed char)((w.y >> 16) & 0xFF);
+            p += x1.w*(float)(signed char)((w.y >> 24) & 0xFF);
+            p += x2.x*(float)(signed char)( w.z        & 0xFF);
+            p += x2.y*(float)(signed char)((w.z >>  8) & 0xFF);
+            p += x2.z*(float)(signed char)((w.z >> 16) & 0xFF);
+            p += x2.w*(float)(signed char)((w.z >> 24) & 0xFF);
+            p += x3.x*(float)(signed char)( w.w        & 0xFF);
+            p += x3.y*(float)(signed char)((w.w >>  8) & 0xFF);
+            p += x3.z*(float)(signed char)((w.w >> 16) & 0xFF);
+            p += x3.w*(float)(signed char)((w.w >> 24) & 0xFF);
+        } else {
+            for (int j = 0; o + j < D; ++j) {
+                p += x[o + j] * (float) row[o + j];
+            }
         }
         acc += p * sc;
     }
@@ -226,8 +250,8 @@ __global__ void cascade_down_kernel(
     float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
     float p0 = 0.0f, p1 = 0.0f, p2 = 0.0f, p3 = 0.0f;
     int cur_b = -1;
-    for (int n = n0; n < n1; ++n) {
-        const int u = min(max((int) list[n], 0), F - 1);
+    const int Fm1 = F - 1;
+    auto step = [&](const int u, const int v) {
         const int b = u >> 5;
         if (b != cur_b) {
             if (cur_b >= 0) {
@@ -240,12 +264,36 @@ __global__ void cascade_down_kernel(
             cur_b = b;
             p0 = p1 = p2 = p3 = 0.0f;
         }
-        const float a  = act[u];
-        const int   v  = *(const int *) (wt + (size_t) u*D + o);
+        const float a = act[u];
         p0 += a * (float) (signed char) ( v        & 0xFF);
         p1 += a * (float) (signed char) ((v >>  8) & 0xFF);
         p2 += a * (float) (signed char) ((v >> 16) & 0xFF);
         p3 += a * (float) (signed char) ((v >> 24) & 0xFF);
+    };
+    int n = n0;
+    for (; n + 8 <= n1; n += 8) {
+        const int u0 = min(max((int) list[n + 0], 0), Fm1);
+        const int u1 = min(max((int) list[n + 1], 0), Fm1);
+        const int u2 = min(max((int) list[n + 2], 0), Fm1);
+        const int u3 = min(max((int) list[n + 3], 0), Fm1);
+        const int u4 = min(max((int) list[n + 4], 0), Fm1);
+        const int u5 = min(max((int) list[n + 5], 0), Fm1);
+        const int u6 = min(max((int) list[n + 6], 0), Fm1);
+        const int u7 = min(max((int) list[n + 7], 0), Fm1);
+        const int v0 = *(const int *) (wt + (size_t) u0*D + o);
+        const int v1 = *(const int *) (wt + (size_t) u1*D + o);
+        const int v2 = *(const int *) (wt + (size_t) u2*D + o);
+        const int v3 = *(const int *) (wt + (size_t) u3*D + o);
+        const int v4 = *(const int *) (wt + (size_t) u4*D + o);
+        const int v5 = *(const int *) (wt + (size_t) u5*D + o);
+        const int v6 = *(const int *) (wt + (size_t) u6*D + o);
+        const int v7 = *(const int *) (wt + (size_t) u7*D + o);
+        step(u0, v0); step(u1, v1); step(u2, v2); step(u3, v3);
+        step(u4, v4); step(u5, v5); step(u6, v6); step(u7, v7);
+    }
+    for (; n < n1; ++n) {
+        const int u = min(max((int) list[n], 0), Fm1);
+        step(u, *(const int *) (wt + (size_t) u*D + o));
     }
     if (cur_b >= 0) {
         const __half * sp = st + (size_t) cur_b*D + o;
@@ -405,6 +453,9 @@ void ggml_cuda_op_cascade_down(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     g_ct.stop(s, g_ct.reduce, g_ct.n_reduce);
     if (g_ct.on && g_ct.n_reduce % 24 == 0) {
         g_ct.dump();
+        if (g_ct.n_up >= 48) {
+            g_ct.on = false;    // stop before graph capture, which cannot contain a blocking sync
+        }
     }
     CUDA_CHECK(cudaGetLastError());
 }
