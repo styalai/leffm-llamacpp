@@ -17,7 +17,7 @@
 #define CASCADE_SEL_MAX   8192   // scores held in shared memory (32 KB)
 #define CASCADE_UP_BLOCK  128   // four warps, one candidate each
 #define CASCADE_UP_WARPS   4
-#define CASCADE_DOWN_SLICES 16
+#define CASCADE_DOWN_SLICES 64
 
 // exact top-`target` of a non-negative score array, compacted into an ascending list of unit ids.
 // thread t owns the contiguous slice [t*per, (t+1)*per) so a scan of per-thread counts yields an
@@ -84,32 +84,39 @@ __global__ void cascade_sel_kernel(
         }
         __syncthreads();
         // pick the digit: the smallest d whose bucket holds the rank we still seek, i.e. the
-        // smallest d with (count of items in digits above d) < need. A serial walk of 256 bins per
-        // pass was a chain of dependent shared loads; a suffix scan finds it in one shot.
-        if (tid == 0) {
-            sel_digit = 255;    // always qualifies (nothing sits above the last bin)
-        }
-        if (tid < 256) {
-            scan[tid] = hist[tid];
-        }
-        __syncthreads();
-        for (int off = 1; off < 256; off <<= 1) {          // inclusive suffix scan over the bins
-            const int v = (tid < 256 && tid + off < 256) ? scan[tid + off] : 0;
-            __syncthreads();
-            if (tid < 256) {
-                scan[tid] += v;
+        // smallest d with (count of items in digits above d) < need. One warp does it with
+        // shuffles: a block-wide scan of 256 bins cost 17 barriers per pass.
+        if (tid < 32) {
+            const int lo = 8*tid;
+            const int t0 = hist[lo + 0], t1 = hist[lo + 1], t2 = hist[lo + 2], t3 = hist[lo + 3];
+            const int t4 = hist[lo + 4], t5 = hist[lo + 5], t6 = hist[lo + 6], t7 = hist[lo + 7];
+            const int tot = t0 + t1 + t2 + t3 + t4 + t5 + t6 + t7;
+            int above = tot;                       // inclusive suffix over the lanes
+            for (int off = 1; off < 32; off <<= 1) {
+                const int v = __shfl_down_sync(0xFFFFFFFFu, above, off);
+                if (tid + off < 32) {
+                    above += v;
+                }
             }
-            __syncthreads();
-        }
-        if (tid < 256) {
-            const int above = scan[tid] - hist[tid];
-            if (above < need) {
-                atomicMin(&sel_digit, tid);
+            const int rank = need - (above - tot);  // rank inside this lane's eight bins
+            if (rank > 0 && rank <= tot) {
+                const int h[8] = {t0, t1, t2, t3, t4, t5, t6, t7};
+                int cum       = 0;
+                int digit     = lo + 7;
+                int rest      = rank;
+                bool found    = false;
+                #pragma unroll
+                for (int d = 7; d >= 0; --d) {
+                    if (!found && cum + h[d] >= rank) {   // first hit from the top holds the rank
+                        digit = lo + d;
+                        rest  = rank - cum;
+                        found = true;
+                    }
+                    cum += h[d];
+                }
+                sel_digit = digit;
+                sel_need  = rest;
             }
-        }
-        __syncthreads();
-        if (tid < 256 && tid == sel_digit) {
-            sel_need = need - (scan[tid] - hist[tid]);
         }
         __syncthreads();
         prefix |= (unsigned) sel_digit << sh;

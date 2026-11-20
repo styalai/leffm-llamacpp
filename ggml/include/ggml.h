@@ -2251,7 +2251,8 @@ extern "C" {
     // per-block dequant and no cross-thread reduce. Pass NULL to use `w_down` directly.
     GGML_API // number of threadgroups the Metal down kernel splits the selected unit list across; the scratch
 // tensor holds one [n_embd] float partial per threadgroup
-#define GGML_CASCADE_DOWN_NTG 16
+#define GGML_CASCADE_DOWN_NTG 16        // Metal: threadgroups per down launch
+#define GGML_CASCADE_DOWN_SLICES_MAX 64 // scratch slices available to any backend
 
 // expand compact logits [V', T] to the full vocab [V, T] with a gather and a -inf sentinel:
 //   out[v, t] = inv[v] < V' ? lt[inv[v], t] : -inf
