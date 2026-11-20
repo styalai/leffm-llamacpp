@@ -221,10 +221,36 @@ __global__ void cascade_up_kernel(
     }
 }
 
-// one block per 128 outputs x one slice of the unit list; partials summed by cascade_down_reduce.
-// each thread owns 4 consecutive outputs and reads them as one 32-bit load, so the gather issues a
-// quarter of the load instructions the byte-at-a-time version did (that version measured 61 GB/s
-// against the up projection's 228 GB/s on an L4).
+// one accumulated unit for one output column group: adds act[u] * wt[u*D + o .. +3] to the running
+// partials, flushing them into the result whenever the unit's 32-unit scale block changes
+static __device__ __forceinline__ void cascade_down_step(
+        const int u, const int v, const int D, const int o,
+        const __half * __restrict__ st, const float * __restrict__ act,
+        int & cur_b, float & a0, float & a1, float & a2, float & a3,
+        float & p0, float & p1, float & p2, float & p3) {
+    const int b = u >> 5;
+    if (b != cur_b) {
+        if (cur_b >= 0) {
+            const __half * sp = st + (size_t) cur_b*D + o;
+            a0 += p0 * __half2float(sp[0]);
+            a1 += p1 * __half2float(sp[1]);
+            a2 += p2 * __half2float(sp[2]);
+            a3 += p3 * __half2float(sp[3]);
+        }
+        cur_b = b;
+        p0 = p1 = p2 = p3 = 0.0f;
+    }
+    const float a = act[u];
+    p0 += a * (float) (signed char) ( v        & 0xFF);
+    p1 += a * (float) (signed char) ((v >>  8) & 0xFF);
+    p2 += a * (float) (signed char) ((v >> 16) & 0xFF);
+    p3 += a * (float) (signed char) ((v >> 24) & 0xFF);
+}
+
+// one block per 512 outputs x one slice of the unit list; partials summed by cascade_down_reduce.
+// each thread owns 4 consecutive outputs, reads them as one 32-bit load, and keeps eight units in
+// flight: this gather is limited by bytes in flight, not by instruction count (it ran at 66 GB/s
+// against the up projection's 180).
 __global__ void cascade_down_kernel(
         const char  * __restrict__ wt,     // [F, D] int8, unit-major
         const __half* __restrict__ st,     // [F/32, D] f16 scales
@@ -246,30 +272,12 @@ __global__ void cascade_down_kernel(
     const int per = (k + nslice - 1) / nslice;
     const int n0  = sl*per;
     const int n1  = min(n0 + per, k);
+    const int Fm1 = F - 1;
 
     float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
     float p0 = 0.0f, p1 = 0.0f, p2 = 0.0f, p3 = 0.0f;
     int cur_b = -1;
-    const int Fm1 = F - 1;
-#define CASCADE_DOWN_STEP(u, v) {
-        const int b = u >> 5;
-        if (b != cur_b) {
-            if (cur_b >= 0) {
-                const __half * sp = st + (size_t) cur_b*D + o;
-                a0 += p0 * __half2float(sp[0]);
-                a1 += p1 * __half2float(sp[1]);
-                a2 += p2 * __half2float(sp[2]);
-                a3 += p3 * __half2float(sp[3]);
-            }
-            cur_b = b;
-            p0 = p1 = p2 = p3 = 0.0f;
-        }
-        const float a = act[u];
-        p0 += a * (float) (signed char) ( v        & 0xFF);
-        p1 += a * (float) (signed char) ((v >>  8) & 0xFF);
-        p2 += a * (float) (signed char) ((v >> 16) & 0xFF);
-        p3 += a * (float) (signed char) ((v >> 24) & 0xFF);
-    }
+
     int n = n0;
     for (; n + 8 <= n1; n += 8) {
         const int u0 = min(max((int) list[n + 0], 0), Fm1);
@@ -288,15 +296,20 @@ __global__ void cascade_down_kernel(
         const int v5 = *(const int *) (wt + (size_t) u5*D + o);
         const int v6 = *(const int *) (wt + (size_t) u6*D + o);
         const int v7 = *(const int *) (wt + (size_t) u7*D + o);
-        CASCADE_DOWN_STEP(u0, v0) CASCADE_DOWN_STEP(u1, v1) CASCADE_DOWN_STEP(u2, v2) CASCADE_DOWN_STEP(u3, v3)
-        CASCADE_DOWN_STEP(u4, v4) CASCADE_DOWN_STEP(u5, v5) CASCADE_DOWN_STEP(u6, v6) CASCADE_DOWN_STEP(u7, v7)
+        cascade_down_step(u0, v0, D, o, st, act, cur_b, a0, a1, a2, a3, p0, p1, p2, p3);
+        cascade_down_step(u1, v1, D, o, st, act, cur_b, a0, a1, a2, a3, p0, p1, p2, p3);
+        cascade_down_step(u2, v2, D, o, st, act, cur_b, a0, a1, a2, a3, p0, p1, p2, p3);
+        cascade_down_step(u3, v3, D, o, st, act, cur_b, a0, a1, a2, a3, p0, p1, p2, p3);
+        cascade_down_step(u4, v4, D, o, st, act, cur_b, a0, a1, a2, a3, p0, p1, p2, p3);
+        cascade_down_step(u5, v5, D, o, st, act, cur_b, a0, a1, a2, a3, p0, p1, p2, p3);
+        cascade_down_step(u6, v6, D, o, st, act, cur_b, a0, a1, a2, a3, p0, p1, p2, p3);
+        cascade_down_step(u7, v7, D, o, st, act, cur_b, a0, a1, a2, a3, p0, p1, p2, p3);
     }
     for (; n < n1; ++n) {
         const int u = min(max((int) list[n], 0), Fm1);
         const int v = *(const int *) (wt + (size_t) u*D + o);
-        CASCADE_DOWN_STEP(u, v)
+        cascade_down_step(u, v, D, o, st, act, cur_b, a0, a1, a2, a3, p0, p1, p2, p3);
     }
-#undef CASCADE_DOWN_STEP
     if (cur_b >= 0) {
         const __half * sp = st + (size_t) cur_b*D + o;
         a0 += p0 * __half2float(sp[0]);
