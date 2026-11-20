@@ -624,7 +624,23 @@ static bool ggml_backend_metal_cpy_tensor_async(ggml_backend_t backend_src, ggml
 static enum ggml_status ggml_backend_metal_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_metal_t ctx = (ggml_metal_t)backend->context;
 
-    return ggml_metal_graph_compute(ctx, cgraph);
+    // GGML_METAL_TIME: CPU-side cost of encoding one graph, i.e. the share that is not GPU work
+    static const bool  time_it = getenv("GGML_METAL_TIME") != nullptr;
+    static uint64_t    t_sum   = 0;
+    static int64_t     n_call  = 0;
+    if (!time_it) {
+        return ggml_metal_graph_compute(ctx, cgraph);
+    }
+
+    const uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    const enum ggml_status st = ggml_metal_graph_compute(ctx, cgraph);
+    const uint64_t t1 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    t_sum += t1 - t0;
+    if (++n_call % 32 == 0) {
+        fprintf(stderr, "[metal] graph encode: %.3f ms/call, %d nodes, %lld calls\n",
+                (double) t_sum/1e6/(double) n_call, cgraph->n_nodes, (long long) n_call);
+    }
+    return st;
 }
 
 static void ggml_backend_metal_event_record(ggml_backend_t backend, ggml_backend_event_t event) {

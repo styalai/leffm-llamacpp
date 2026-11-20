@@ -122,6 +122,13 @@ ggml_tensor * llm_build_lfm_base::build_lfm_cascade_ffn(ggml_tensor * cur, int i
                                                    GGML_CASCADE_DOWN_NTG * model.hparams.n_embd);
     struct ggml_tensor * y = ggml_cascade_down(ctx0, sel, model.layers[il].ffn_down, w_t, s_t, part, k);
     cb(y, "model.layers.{}.ffn_cascade_down", il);
+    {   // LLAMA_CASCADE_EXTRA_NODES: add N cheap ops per layer to price one graph node
+        static const int extra = getenv("LLAMA_CASCADE_EXTRA_NODES") ? atoi(getenv("LLAMA_CASCADE_EXTRA_NODES")) : 0;
+        for (int r = 0; r < extra; ++r) {
+            y = ggml_scale(ctx0, y, 1.0f);
+            cb(y, "model.layers.{}.cascade_probe", il);
+        }
+    }
     return y;
 }
 
