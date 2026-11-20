@@ -41,6 +41,7 @@ __global__ void cascade_sel_kernel(
     extern __shared__ float s[];              // nin scores
     __shared__ int hist[256];
     __shared__ int scan[CASCADE_SEL_BLOCK];
+    __shared__ int sel_digit, sel_need;
     const int tid = threadIdx.x;
     const int nt  = blockDim.x;
     const int per = (nin + nt - 1) / nt;
@@ -81,22 +82,37 @@ __global__ void cascade_sel_kernel(
             }
         }
         __syncthreads();
+        // pick the digit: the smallest d whose bucket holds the rank we still seek, i.e. the
+        // smallest d with (count of items in digits above d) < need. A serial walk of 256 bins per
+        // pass was a chain of dependent shared loads; a suffix scan finds it in one shot.
         if (tid == 0) {
-            int cum = 0, digit = 0;
-            for (int d = 255; d >= 0; --d) {
-                if (cum + hist[d] >= need) {
-                    digit = d;
-                    need -= cum;
-                    break;
-                }
-                cum += hist[d];
-            }
-            hist[0] = digit;
-            hist[1] = need;
+            sel_digit = 255;    // always qualifies (nothing sits above the last bin)
+        }
+        if (tid < 256) {
+            scan[tid] = hist[tid];
         }
         __syncthreads();
-        prefix |= (unsigned) hist[0] << sh;
-        need = hist[1];
+        for (int off = 1; off < 256; off <<= 1) {          // inclusive suffix scan over the bins
+            const int v = (tid < 256 && tid + off < 256) ? scan[tid + off] : 0;
+            __syncthreads();
+            if (tid < 256) {
+                scan[tid] += v;
+            }
+            __syncthreads();
+        }
+        if (tid < 256) {
+            const int above = scan[tid] - hist[tid];
+            if (above < need) {
+                atomicMin(&sel_digit, tid);
+            }
+        }
+        __syncthreads();
+        if (tid < 256 && tid == sel_digit) {
+            sel_need = need - (scan[tid] - hist[tid]);
+        }
+        __syncthreads();
+        prefix |= (unsigned) sel_digit << sh;
+        need = sel_need;
         __syncthreads();
     }
     const unsigned thr = prefix;
