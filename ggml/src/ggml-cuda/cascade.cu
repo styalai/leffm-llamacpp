@@ -68,7 +68,7 @@ template<bool STAGE0>
 __global__ void cascade_sel_kernel(
         const float * __restrict__ g,
         const float * __restrict__ act,
-        const int   * __restrict__ list_in,
+        const float * __restrict__ list_in,
         float       * __restrict__ list_out,
         const int F,
         const int c,
@@ -86,7 +86,7 @@ __global__ void cascade_sel_kernel(
                 const float gv = g[t];
                 s[t] = fabsf(gv / (1.0f + expf(-gv)));
             } else {
-                s[t] = fabsf(act[list_in[t]]);
+                s[t] = fabsf(act[(int) list_in[t]]);
             }
         } else {
             s[t] = 0.0f;
@@ -154,7 +154,7 @@ __global__ void cascade_sel_kernel(
     // pad with a valid unit id: a short list would otherwise leave uninitialised ids that the next
     // stage reads as unit indices
     for (int p = total + tid; p < target; p += nt) {
-        list_out[p] = STAGE0 ? 0.0f : (list_in[0] >= 0.0f ? list_in[0] : 0.0f);
+        list_out[p] = STAGE0 ? 0.0f : ((int) list_in[0] >= 0 ? list_in[0] : 0.0f);
     }
 }
 
@@ -318,7 +318,7 @@ void ggml_cuda_op_cascade_up(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
 
     if (!cascade_skip("sel0"))
     cascade_sel_kernel<true><<<1, CASCADE_SEL_BLOCK, shmem, st>>>(
-        (const float *) g->data, act, (const int *) lsk, lst, F, c, F, c);
+        (const float *) g->data, act, lsk, lst, F, c, F, c);
     CUDA_CHECK(cudaGetLastError());
 
     if (!cascade_skip("up"))
@@ -329,7 +329,7 @@ void ggml_cuda_op_cascade_up(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
 
     if (!cascade_skip("sel1"))
     cascade_sel_kernel<false><<<1, CASCADE_SEL_BLOCK, (int) (c*sizeof(float)), st>>>(
-        (const float *) g->data, act, (const int *) lst, lsk, F, c, c, k);
+        (const float *) g->data, act, lst, lsk, F, c, c, k);
     CUDA_CHECK(cudaGetLastError());
 }
 
