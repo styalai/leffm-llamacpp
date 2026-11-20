@@ -2741,6 +2741,37 @@ void ggml_compute_forward_cascade_up(const struct ggml_compute_params * params,
     }
 }
 
+// ggml_compute_forward_cascade_expand
+//
+// expand compact logits [V', T] into the full vocab [V, T] with a gather and a -inf sentinel
+void ggml_compute_forward_cascade_expand(const struct ggml_compute_params * params,
+                                          struct ggml_tensor * dst) {
+    const struct ggml_tensor * lt   = dst->src[0];
+    const struct ggml_tensor * inv  = dst->src[1];
+    const struct ggml_tensor * ninf = dst->src[2];
+
+    const int64_t V  = dst->ne[0];
+    const int64_t T  = dst->ne[1];
+    const int64_t Vt = lt->ne[0];
+
+    const int32_t * iv = (const int32_t *) inv->data;
+    const float   * l  = (const float   *) lt->data;
+    const float     ni = *(const float  *) ninf->data;
+    float         * o  = (float         *) dst->data;
+
+    const int64_t n   = V*T;
+    const int64_t per = (n + params->nth - 1)/params->nth;
+    const int64_t i0  = per*params->ith;
+    const int64_t i1  = MIN(i0 + per, n);
+
+    for (int64_t i = i0; i < i1; ++i) {
+        const int64_t v = i % V;
+        const int64_t t = i / V;
+        const int32_t p = iv[v];
+        o[i] = (p < Vt) ? l[p + t*Vt] : ni;
+    }
+}
+
 // ggml_compute_forward_cascade_down
 //
 // LFM3 cascade FFN, stage 2: y[o] = sum_{j<k} sel[2][j] * w_down[o, sel[1][j]].

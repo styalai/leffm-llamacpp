@@ -363,3 +363,23 @@ kernel void kernel_cascade_up(
         }
     }
 }
+
+kernel void kernel_cascade_expand(
+        constant ggml_metal_kargs_cascade_expand & args,
+        device const float * lt,       // [V', T] compact logits
+        device const int   * inv,      // [V] position of each vocab id, or V' for dropped
+        device const float * ninf,     // [1] the -inf sentinel
+        device       float * out,      // [V, T]
+        uint gid [[thread_position_in_grid]]) {
+    const int V  = args.V;
+    const int T  = args.T;
+    const int Vt = args.Vt;
+    const int n  = V*T;
+    if ((int) gid >= n) {
+        return;
+    }
+    const int v = (int) gid % V;
+    const int t = (int) gid / V;
+    const int p = inv[v];
+    out[gid] = (p < Vt) ? lt[p + t*Vt] : ninf[0];
+}

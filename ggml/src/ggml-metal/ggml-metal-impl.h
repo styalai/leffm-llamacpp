@@ -1471,6 +1471,12 @@ typedef struct {
 } ggml_metal_kargs_cascade_reduce;
 
 typedef struct {
+    int32_t V;      // full vocab
+    int32_t T;      // tokens
+    int32_t Vt;     // kept ids
+} ggml_metal_kargs_cascade_expand;
+
+typedef struct {
     int32_t F;      // number of units
     int32_t c;      // count to keep
     int32_t stage;  // 0: score from g, 1: score from act

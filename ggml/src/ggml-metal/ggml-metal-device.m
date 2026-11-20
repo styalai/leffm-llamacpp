@@ -2019,6 +2019,10 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                         return false;
                 };
             }
+        case GGML_OP_CASCADE_EXPAND:
+            return op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[1] != NULL && op->src[1]->type == GGML_TYPE_I32 &&
+                   op->src[2] != NULL && op->src[2]->type == GGML_TYPE_F32;
         case GGML_OP_CASCADE_UP:
             return op->src[3] != NULL && op->src[3]->type == GGML_TYPE_I8 && op->src[4] != NULL;
         case GGML_OP_CASCADE_DOWN:

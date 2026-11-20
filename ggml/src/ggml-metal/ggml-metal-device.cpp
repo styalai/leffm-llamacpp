@@ -2844,6 +2844,14 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cascade_reduce(g
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cascade_expand(ggml_metal_library_t lib) {
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, "kernel_cascade_expand");
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, "kernel_cascade_expand", "kernel_cascade_expand", nullptr);
+    }
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_silu_back(ggml_metal_library_t lib, const ggml_tensor * op) {
     assert(op->op == GGML_OP_SILU_BACK);
 

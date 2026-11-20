@@ -1890,6 +1890,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_cascade_up(params, tensor);
             } break;
+        case GGML_OP_CASCADE_EXPAND:
         case GGML_OP_CASCADE_DOWN:
             {
                 ggml_compute_forward_cascade_down(params, tensor);
@@ -2515,6 +2516,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
                 n_tasks = n_threads;
             } break;
         case GGML_OP_CASCADE_UP:
+        case GGML_OP_CASCADE_EXPAND:
         case GGML_OP_CASCADE_DOWN:
             {
                 // one task: the kernels use threadpool barriers between phases

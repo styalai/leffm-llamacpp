@@ -328,6 +328,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_cascade_up(ctx, idx);
             } break;
+        case GGML_OP_CASCADE_EXPAND:
+            {
+                n_fuse = ggml_metal_op_cascade_expand(ctx, idx);
+            } break;
         case GGML_OP_CASCADE_DOWN:
             {
                 n_fuse = ggml_metal_op_cascade_down(ctx, idx);
@@ -4595,6 +4599,38 @@ int ggml_metal_op_cascade_up(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_buffer  (enc, bid_mf,  4);   // float list for stage 1
         ggml_metal_encoder_dispatch_threadgroups(enc, 1, 1, 1, ntg_sel, 1, 1);
     }
+
+    return 1;
+}
+
+int ggml_metal_op_cascade_expand(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    auto pipeline = ggml_metal_library_get_pipeline_cascade_expand(lib);
+
+    ggml_tensor * lt   = op->src[0];
+    ggml_tensor * inv  = op->src[1];
+    ggml_tensor * ninf = op->src[2];
+
+    ggml_metal_kargs_cascade_expand args = {
+        /*.V  =*/ (int32_t) op->ne[0],
+        /*.T  =*/ (int32_t) op->ne[1],
+        /*.Vt =*/ (int32_t) lt->ne[0],
+    };
+
+    int arg_idx{0};
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), arg_idx++);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(lt),   arg_idx++);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(inv),  arg_idx++);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(ninf), arg_idx++);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),   arg_idx++);
+
+    const int64_t n = op->ne[0]*op->ne[1];
+    ggml_metal_encoder_dispatch_threadgroups(enc, (int) ((n + 255)/256), 1, 1, 256, 1, 1);
 
     return 1;
 }

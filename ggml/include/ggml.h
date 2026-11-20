@@ -433,6 +433,7 @@ extern "C" {
 
         GGML_OP_CASCADE_UP,
         GGML_OP_CASCADE_DOWN,
+        GGML_OP_CASCADE_EXPAND,
 
         GGML_OP_COUNT,
     };
@@ -2252,7 +2253,16 @@ extern "C" {
 // tensor holds one [n_embd] float partial per threadgroup
 #define GGML_CASCADE_DOWN_NTG 16
 
-struct ggml_tensor * ggml_cascade_down(
+// expand compact logits [V', T] to the full vocab [V, T] with a gather and a -inf sentinel:
+//   out[v, t] = inv[v] < V' ? lt[inv[v], t] : -inf
+// one element per thread, coalesced -- the row-based get_rows/set_rows are launch-bound at T = 1
+struct ggml_tensor * ggml_cascade_expand(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * lt,
+        struct ggml_tensor  * inv,
+        struct ggml_tensor  * ninf);
+
+GGML_API struct ggml_tensor * ggml_cascade_down(
             struct ggml_context * ctx,
             struct ggml_tensor  * sel,
             struct ggml_tensor  * w_down,
