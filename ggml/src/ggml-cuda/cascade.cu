@@ -15,7 +15,8 @@
 
 #define CASCADE_SEL_BLOCK 1024
 #define CASCADE_SEL_MAX   8192   // scores held in shared memory (32 KB)
-#define CASCADE_UP_BLOCK  128
+#define CASCADE_UP_BLOCK  128   // four warps, one candidate each
+#define CASCADE_UP_WARPS   4
 #define CASCADE_DOWN_SLICES 16
 
 // exact top-`target` of a non-negative score array, compacted into an ascending list of unit ids.
@@ -143,10 +144,10 @@ __global__ void cascade_sel_kernel(
     }
 }
 
-// one block per candidate: dot of the unit's int8 row against x, with the per-32-block scales.
-// each thread reads 16 consecutive weights as one 16-byte load (the row is 16-byte aligned, and 16
-// values never straddle a 32-value scale block), so the row is fetched in 128-byte transactions and
-// each thread keeps 16 bytes in flight instead of 4.
+// one warp per candidate: dot of the unit's int8 row against x, with the per-32-block scales.
+// The row is fetched as 16-byte loads (16 values never straddle a 32-value scale block, and the row
+// is 16-byte aligned), and the dot reduces through warp shuffles, so a block of four warps has no
+// barrier at all: the earlier block-wide reduction cost more than the 2 KB a candidate actually reads.
 __global__ void cascade_up_kernel(
         const char  * __restrict__ wu,     // [F, D] int8, unit-major
         const __half* __restrict__ wus,    // [F, D/32] f16 scales
@@ -157,67 +158,55 @@ __global__ void cascade_up_kernel(
         const int D,
         const int F,
         const int c) {
-    const int idx = blockIdx.x;
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int idx  = blockIdx.x*CASCADE_UP_WARPS + warp;
     if (idx >= c) {
         return;
     }
-    const int u   = min(max((int) list[idx], 0), F - 1);
-    const int NB  = D / 32;
-    const int tid = threadIdx.x;
-    const int nt  = blockDim.x;
-
-    __shared__ float red[CASCADE_UP_BLOCK];
-
+    const int u = min(max((int) list[idx], 0), F - 1);
     const char *   row = wu  + (size_t) u*D;
-    const __half * wsr = wus + (size_t) u*NB;
+    const __half * wsr = wus + (size_t) u*(D/32);
 
-    const int vec    = 16;
-    const int stride = nt*vec;
+    const int chunks = D / 16;
     float acc = 0.0f;
-    for (int o = tid*vec; o < D; o += stride) {
-        const float sc = __half2float(wsr[o >> 5]);
+    for (int k = lane; k < chunks; k += 32) {
+        const int o = k*16;
+        const int4   w  = *(const int4   *) (row + o);
+        const float4 x0 = *(const float4 *) (x + o);
+        const float4 x1 = *(const float4 *) (x + o + 4);
+        const float4 x2 = *(const float4 *) (x + o + 8);
+        const float4 x3 = *(const float4 *) (x + o + 12);
         float p = 0.0f;
-        if (o + vec <= D) {
-            const int4   w = *(const int4   *) (row + o);
-            const float4 x0 = *(const float4 *) (x + o);
-            const float4 x1 = *(const float4 *) (x + o + 4);
-            const float4 x2 = *(const float4 *) (x + o + 8);
-            const float4 x3 = *(const float4 *) (x + o + 12);
-            p += x0.x*(float)(signed char)( w.x        & 0xFF);
-            p += x0.y*(float)(signed char)((w.x >>  8) & 0xFF);
-            p += x0.z*(float)(signed char)((w.x >> 16) & 0xFF);
-            p += x0.w*(float)(signed char)((w.x >> 24) & 0xFF);
-            p += x1.x*(float)(signed char)( w.y        & 0xFF);
-            p += x1.y*(float)(signed char)((w.y >>  8) & 0xFF);
-            p += x1.z*(float)(signed char)((w.y >> 16) & 0xFF);
-            p += x1.w*(float)(signed char)((w.y >> 24) & 0xFF);
-            p += x2.x*(float)(signed char)( w.z        & 0xFF);
-            p += x2.y*(float)(signed char)((w.z >>  8) & 0xFF);
-            p += x2.z*(float)(signed char)((w.z >> 16) & 0xFF);
-            p += x2.w*(float)(signed char)((w.z >> 24) & 0xFF);
-            p += x3.x*(float)(signed char)( w.w        & 0xFF);
-            p += x3.y*(float)(signed char)((w.w >>  8) & 0xFF);
-            p += x3.z*(float)(signed char)((w.w >> 16) & 0xFF);
-            p += x3.w*(float)(signed char)((w.w >> 24) & 0xFF);
-        } else {
-            for (int j = 0; o + j < D; ++j) {
-                p += x[o + j] * (float) row[o + j];
-            }
-        }
-        acc += p * sc;
+        p += x0.x*(float)(signed char)( w.x        & 0xFF);
+        p += x0.y*(float)(signed char)((w.x >>  8) & 0xFF);
+        p += x0.z*(float)(signed char)((w.x >> 16) & 0xFF);
+        p += x0.w*(float)(signed char)((w.x >> 24) & 0xFF);
+        p += x1.x*(float)(signed char)( w.y        & 0xFF);
+        p += x1.y*(float)(signed char)((w.y >>  8) & 0xFF);
+        p += x1.z*(float)(signed char)((w.y >> 16) & 0xFF);
+        p += x1.w*(float)(signed char)((w.y >> 24) & 0xFF);
+        p += x2.x*(float)(signed char)( w.z        & 0xFF);
+        p += x2.y*(float)(signed char)((w.z >>  8) & 0xFF);
+        p += x2.z*(float)(signed char)((w.z >> 16) & 0xFF);
+        p += x2.w*(float)(signed char)((w.z >> 24) & 0xFF);
+        p += x3.x*(float)(signed char)( w.w        & 0xFF);
+        p += x3.y*(float)(signed char)((w.w >>  8) & 0xFF);
+        p += x3.z*(float)(signed char)((w.w >> 16) & 0xFF);
+        p += x3.w*(float)(signed char)((w.w >> 24) & 0xFF);
+        acc += p * __half2float(wsr[o >> 5]);
     }
-
-    red[tid] = acc;
-    __syncthreads();
-    for (int st = nt/2; st > 0; st >>= 1) {
-        if (tid < st) {
-            red[tid] += red[tid + st];
+    if (lane == 0) {
+        for (int j = chunks*16; j < D; ++j) {     // D is a multiple of 16 in practice
+            acc += x[j] * (float) row[j] * __half2float(wsr[j >> 5]);
         }
-        __syncthreads();
     }
-    if (tid == 0) {
+    for (int off = 16; off > 0; off >>= 1) {
+        acc += __shfl_down_sync(0xffffffffu, acc, off);
+    }
+    if (lane == 0) {
         const float gv = g[u];
-        act[u] = (gv / (1.0f + expf(-gv))) * red[0];
+        act[u] = (gv / (1.0f + expf(-gv))) * acc;
     }
 }
 
@@ -424,7 +413,7 @@ void ggml_cuda_op_cascade_up(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
 
     g_ct.start(st);
     if (!cascade_skip("up"))
-    cascade_up_kernel<<<c, CASCADE_UP_BLOCK, 0, st>>>(
+    cascade_up_kernel<<<(c + CASCADE_UP_WARPS - 1)/CASCADE_UP_WARPS, CASCADE_UP_BLOCK, 0, st>>>(
         (const char *) wu->data, (const __half *) wus->data,
         (const float *) x->data, (const float *) g->data, lst, act, D, F, c);
     g_ct.stop(st, g_ct.up, g_ct.n_up);
