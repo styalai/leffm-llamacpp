@@ -18,52 +18,16 @@
 #define CASCADE_UP_BLOCK  256
 #define CASCADE_DOWN_SLICES 8
 
-static __device__ __forceinline__ int block_reduce_min(int v, int * smem) {
-    smem[threadIdx.x] = v;
-    __syncthreads();
-    for (int s = blockDim.x/2; s > 0; s >>= 1) {
-        if (threadIdx.x < s) {
-            smem[threadIdx.x] = min(smem[threadIdx.x], smem[threadIdx.x + s]);
-        }
-        __syncthreads();
-    }
-    const int r = smem[0];
-    __syncthreads();
-    return r;
-}
-
-static __device__ __forceinline__ int block_reduce_max(int v, int * smem) {
-    smem[threadIdx.x] = v;
-    __syncthreads();
-    for (int s = blockDim.x/2; s > 0; s >>= 1) {
-        if (threadIdx.x < s) {
-            smem[threadIdx.x] = max(smem[threadIdx.x], smem[threadIdx.x + s]);
-        }
-        __syncthreads();
-    }
-    const int r = smem[0];
-    __syncthreads();
-    return r;
-}
-
-static __device__ __forceinline__ int block_reduce_sum(int v, int * smem) {
-    smem[threadIdx.x] = v;
-    __syncthreads();
-    for (int s = blockDim.x/2; s > 0; s >>= 1) {
-        if (threadIdx.x < s) {
-            smem[threadIdx.x] += smem[threadIdx.x + s];
-        }
-        __syncthreads();
-    }
-    const int r = smem[0];
-    __syncthreads();
-    return r;
-}
-
-// exact top-`target` of a score array, compacted into an ascending list of unit ids.
+// exact top-`target` of a non-negative score array, compacted into an ascending list of unit ids.
 // thread t owns the contiguous slice [t*per, (t+1)*per) so a scan of per-thread counts yields an
 // ascending list with no sort (same property the Metal kernel relies on).
 // stage 0 scores |silu(g_j)| over j < F; stage 1 scores |act[list_in[i]]| over the c candidates.
+//
+// Selection is a radix select on the IEEE-754 bit pattern of the (non-negative) score: positive
+// floats are monotone in their bit pattern, so four 8-bit histogram passes find the exact
+// target-th largest value. It replaces a 32-round bisection whose per-round block-wide reduction
+// dominated the cascade on an L4: measured with CASCADE_CUDA_SKIP, the two selections cost 6.6 of
+// the 7.0 ms/token the recipe lost against dense, i.e. ~94% of the whole regression.
 template<bool STAGE0>
 __global__ void cascade_sel_kernel(
         const float * __restrict__ g,
@@ -75,6 +39,8 @@ __global__ void cascade_sel_kernel(
         const int nin,
         const int target) {
     extern __shared__ float s[];              // nin scores
+    __shared__ int hist[256];
+    __shared__ int scan[CASCADE_SEL_BLOCK];
     const int tid = threadIdx.x;
     const int nt  = blockDim.x;
     const int per = (nin + nt - 1) / nt;
@@ -88,73 +54,76 @@ __global__ void cascade_sel_kernel(
                 const float gv = g[t];
                 s[t] = fabsf(gv / (1.0f + expf(-gv)));
             } else {
-                s[t] = fabsf(act[(int) list_in[t]]);
+                s[t] = fabsf(act[min(max((int) list_in[t], 0), F - 1)]);
             }
         }
     }
     __syncthreads();
 
-    int lo = 0x7fffffff, hi = 0;
-    for (int i = 0; i < per; ++i) {
-        const int t = tid*per + i;
-        if (t < nin) {
-            const int b = __float_as_int(s[t]);
-            lo = min(lo, b);
-            hi = max(hi, b);
+    // four 8-bit passes: prefix holds the bits already resolved, `need` is the rank still sought
+    // inside that prefix bucket
+    unsigned prefix = 0u;
+    int need = target;
+    for (int sh = 24; sh >= 0; sh -= 8) {
+        for (int b = tid; b < 256; b += nt) {
+            hist[b] = 0;
         }
-    }
-    __shared__ int scr[CASCADE_SEL_BLOCK];
-    lo = block_reduce_min(lo, scr);
-    hi = block_reduce_max(hi, scr);
-
-    for (int it = 0; it < 32; ++it) {
-        const int   mid = lo + (hi - lo + 1)/2;
-        const float thr = __int_as_float(mid);
-        int cnt = 0;
+        __syncthreads();
+        const unsigned above = (sh == 24) ? 0u : (0xFFFFFFFFu << (sh + 8));
+        const unsigned want  = prefix & above;
         for (int i = 0; i < per; ++i) {
             const int t = tid*per + i;
-            if (t < nin && s[t] >= thr) {
-                ++cnt;
+            if (t < nin) {
+                const unsigned bits = __float_as_uint(s[t]);
+                if ((bits & above) == want) {
+                    atomicAdd(&hist[(bits >> sh) & 0xFF], 1);
+                }
             }
         }
-        const int tot = block_reduce_sum(cnt, scr);
-        if (tot >= target) { lo = mid; } else { hi = mid - 1; }
+        __syncthreads();
+        if (tid == 0) {
+            int cum = 0, digit = 0;
+            for (int d = 255; d >= 0; --d) {
+                if (cum + hist[d] >= need) {
+                    digit = d;
+                    need -= cum;
+                    break;
+                }
+                cum += hist[d];
+            }
+            hist[0] = digit;
+            hist[1] = need;
+        }
+        __syncthreads();
+        prefix |= (unsigned) hist[0] << sh;
+        need = hist[1];
         __syncthreads();
     }
-    const float thr = __int_as_float(lo);
+    const unsigned thr = prefix;
 
+    // compaction: ascending ids of the qualifying entries, capped at `target` so the list is exactly
+    // the size the gathered kernels index
     int cnt = 0;
     for (int i = 0; i < per; ++i) {
         const int t = tid*per + i;
-        if (t < nin && s[t] >= thr && s[t] > 0.0f) {
+        if (t < nin && __float_as_uint(s[t]) >= thr) {
             ++cnt;
         }
     }
-    // exclusive scan of cnt over threads (Hillis-Steele)
-    scr[tid] = cnt;
+    scan[tid] = cnt;
     __syncthreads();
-    for (int off = 1; off < nt; off <<= 1) {
-        const int v = (tid >= off) ? scr[tid - off] : 0;
+    for (int off = 1; off < nt; off <<= 1) {          // Hillis-Steele exclusive scan
+        const int v = (tid >= off) ? scan[tid - off] : 0;
         __syncthreads();
-        scr[tid] += v;
+        scan[tid] += v;
         __syncthreads();
     }
-    const int base = scr[tid] - cnt;
-    int pos = base;
+    int pos = scan[tid] - cnt;
     for (int i = 0; i < per; ++i) {
         const int t = tid*per + i;
-        if (t < nin && s[t] >= thr && s[t] > 0.0f) {
-            list_out[pos++] = STAGE0 ? (float) t : (float) list_in[t];
+        if (t < nin && __float_as_uint(s[t]) >= thr && pos < target) {
+            list_out[pos++] = STAGE0 ? (float) t : list_in[t];
         }
-    }
-
-    // the full count of written entries is the last element of the inclusive scan
-    __syncthreads();
-    const int total = scr[nt - 1];
-    // pad with a valid unit id: a short list would otherwise leave uninitialised ids that the next
-    // stage reads as unit indices
-    for (int p = total + tid; p < target; p += nt) {
-        list_out[p] = STAGE0 ? 0.0f : ((int) list_in[0] >= 0 ? list_in[0] : 0.0f);
     }
 }
 
