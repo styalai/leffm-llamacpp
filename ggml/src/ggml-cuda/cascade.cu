@@ -251,7 +251,7 @@ __global__ void cascade_down_kernel(
     float p0 = 0.0f, p1 = 0.0f, p2 = 0.0f, p3 = 0.0f;
     int cur_b = -1;
     const int Fm1 = F - 1;
-    auto step = [&](const int u, const int v) {
+#define CASCADE_DOWN_STEP(u, v) {
         const int b = u >> 5;
         if (b != cur_b) {
             if (cur_b >= 0) {
@@ -269,7 +269,7 @@ __global__ void cascade_down_kernel(
         p1 += a * (float) (signed char) ((v >>  8) & 0xFF);
         p2 += a * (float) (signed char) ((v >> 16) & 0xFF);
         p3 += a * (float) (signed char) ((v >> 24) & 0xFF);
-    };
+    }
     int n = n0;
     for (; n + 8 <= n1; n += 8) {
         const int u0 = min(max((int) list[n + 0], 0), Fm1);
@@ -288,13 +288,15 @@ __global__ void cascade_down_kernel(
         const int v5 = *(const int *) (wt + (size_t) u5*D + o);
         const int v6 = *(const int *) (wt + (size_t) u6*D + o);
         const int v7 = *(const int *) (wt + (size_t) u7*D + o);
-        step(u0, v0); step(u1, v1); step(u2, v2); step(u3, v3);
-        step(u4, v4); step(u5, v5); step(u6, v6); step(u7, v7);
+        CASCADE_DOWN_STEP(u0, v0) CASCADE_DOWN_STEP(u1, v1) CASCADE_DOWN_STEP(u2, v2) CASCADE_DOWN_STEP(u3, v3)
+        CASCADE_DOWN_STEP(u4, v4) CASCADE_DOWN_STEP(u5, v5) CASCADE_DOWN_STEP(u6, v6) CASCADE_DOWN_STEP(u7, v7)
     }
     for (; n < n1; ++n) {
         const int u = min(max((int) list[n], 0), Fm1);
-        step(u, *(const int *) (wt + (size_t) u*D + o));
+        const int v = *(const int *) (wt + (size_t) u*D + o);
+        CASCADE_DOWN_STEP(u, v)
     }
+#undef CASCADE_DOWN_STEP
     if (cur_b >= 0) {
         const __half * sp = st + (size_t) cur_b*D + o;
         a0 += p0 * __half2float(sp[0]);
