@@ -16,7 +16,7 @@
 #define CASCADE_SEL_BLOCK 1024
 #define CASCADE_SEL_MAX   8192   // scores held in shared memory (32 KB)
 #define CASCADE_UP_BLOCK  256
-#define CASCADE_DOWN_SLICES 8
+#define CASCADE_DOWN_SLICES 16
 
 // exact top-`target` of a non-negative score array, compacted into an ascending list of unit ids.
 // thread t owns the contiguous slice [t*per, (t+1)*per) so a scan of per-thread counts yields an
@@ -200,16 +200,15 @@ __global__ void cascade_down_kernel(
     const int sl    = blockIdx.x % nslice;
     const int ch    = blockIdx.x / nslice;
     const int o     = ch*chunk + threadIdx.x*vec;
-    if (o >= D) {
-        return;
+    if (o + vec > D) {
+        return;   // D is a multiple of 4 by the repack precondition (n_embd % 128 == 0)
     }
     const int per = (k + nslice - 1) / nslice;
     const int n0  = sl*per;
     const int n1  = min(n0 + per, k);
-    const bool full = o + vec <= D;
 
-    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    float abl[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+    float p0 = 0.0f, p1 = 0.0f, p2 = 0.0f, p3 = 0.0f;
     int cur_b = -1;
     for (int n = n0; n < n1; ++n) {
         const int u = min(max((int) list[n], 0), F - 1);
@@ -217,36 +216,32 @@ __global__ void cascade_down_kernel(
         if (b != cur_b) {
             if (cur_b >= 0) {
                 const __half * sp = st + (size_t) cur_b*D + o;
-                for (int j = 0; j < vec && o + j < D; ++j) {
-                    acc[j] += abl[j] * __half2float(sp[j]);
-                }
+                a0 += p0 * __half2float(sp[0]);
+                a1 += p1 * __half2float(sp[1]);
+                a2 += p2 * __half2float(sp[2]);
+                a3 += p3 * __half2float(sp[3]);
             }
             cur_b = b;
-            abl[0] = abl[1] = abl[2] = abl[3] = 0.0f;
+            p0 = p1 = p2 = p3 = 0.0f;
         }
-        const float a = act[u];
-        const char * row = wt + (size_t) u*D + o;
-        if (full) {
-            const int v = *(const int *) row;
-            abl[0] += a * (float) (signed char) ( v        & 0xFF);
-            abl[1] += a * (float) (signed char) ((v >>  8) & 0xFF);
-            abl[2] += a * (float) (signed char) ((v >> 16) & 0xFF);
-            abl[3] += a * (float) (signed char) ((v >> 24) & 0xFF);
-        } else {
-            for (int j = 0; j < vec && o + j < D; ++j) {
-                abl[j] += a * (float) row[j];
-            }
-        }
+        const float a  = act[u];
+        const int   v  = *(const int *) (wt + (size_t) u*D + o);
+        p0 += a * (float) (signed char) ( v        & 0xFF);
+        p1 += a * (float) (signed char) ((v >>  8) & 0xFF);
+        p2 += a * (float) (signed char) ((v >> 16) & 0xFF);
+        p3 += a * (float) (signed char) ((v >> 24) & 0xFF);
     }
     if (cur_b >= 0) {
         const __half * sp = st + (size_t) cur_b*D + o;
-        for (int j = 0; j < vec && o + j < D; ++j) {
-            acc[j] += abl[j] * __half2float(sp[j]);
-        }
+        a0 += p0 * __half2float(sp[0]);
+        a1 += p1 * __half2float(sp[1]);
+        a2 += p2 * __half2float(sp[2]);
+        a3 += p3 * __half2float(sp[3]);
     }
-    for (int j = 0; j < vec && o + j < D; ++j) {
-        part[(size_t) sl*D + o + j] = acc[j];
-    }
+    part[(size_t) sl*D + o    ] = a0;
+    part[(size_t) sl*D + o + 1] = a1;
+    part[(size_t) sl*D + o + 2] = a2;
+    part[(size_t) sl*D + o + 3] = a3;
 }
 
 __global__ void cascade_down_reduce_kernel(
@@ -295,9 +290,7 @@ struct ct_timers {
         on = e != nullptr && e[0] == '1';
         if (on) { cudaEventCreate(&e0); cudaEventCreate(&e1); }
     }
-    ~ct_timers() {
-        if (!on) { return; }
-        cudaEventSynchronize(e1);
+    void dump() {
         fprintf(stderr,
                 "CASCADE_CUDA_TIME sel0=%.1fms/%ld up=%.1fms/%ld sel1=%.1fms/%ld down=%.1fms/%ld "
                 "reduce=%.1fms/%ld expand=%.1fms/%ld\n",
@@ -394,6 +387,9 @@ void ggml_cuda_op_cascade_down(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     cascade_down_reduce_kernel<<<(D + 255)/256, 256, 0, s>>>(
         (const float *) sp->data, (float *) dst->data, D, S);
     g_ct.stop(s, g_ct.reduce, g_ct.n_reduce);
+    if (g_ct.on && g_ct.n_reduce % 24 == 0) {
+        g_ct.dump();
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 

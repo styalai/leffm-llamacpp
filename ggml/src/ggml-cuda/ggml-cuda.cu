@@ -6696,6 +6696,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return op->src[3] != nullptr && op->src[3]->type == GGML_TYPE_I8 && op->src[4] != nullptr &&
                    op->src[0]->ne[0] <= 8192;
         case GGML_OP_CASCADE_DOWN:
+            // the kernel reads four outputs per thread with one 32-bit load
+            if (op->ne[0] % 4 != 0) { return false; }
             return op->src[2] != nullptr && op->src[2]->type == GGML_TYPE_I8 && op->src[2]->ne[1] > 1 &&
                    op->src[3] != nullptr && op->src[3]->type == GGML_TYPE_F16 && op->src[4] != nullptr;
         case GGML_OP_CASCADE_EXPAND:
