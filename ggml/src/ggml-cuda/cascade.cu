@@ -9,9 +9,9 @@
 //   CASCADE_DOWN    gathered down dots with a unit-major int8 repack and per-32-block f16 scales
 //   CASCADE_EXPAND  compact logits [V', 1] -> full vocab [V, 1] with a -inf sentinel
 //
-// The selection is exact: positive IEEE-754 floats are monotone in their bit pattern, so bisecting
-// [bits(min), bits(max)] 32 times finds the exact c-th (k-th) largest value. Both selections run in
-// one block: F and c are small enough for the scores to live in shared memory.
+// The selection is exact: positive IEEE-754 floats are monotone in their bit pattern, so four 8-bit
+// radix passes find the exact c-th (k-th) largest value. Both selections run in one block: F and c
+// are small enough for the scores to live in shared memory.
 
 #define CASCADE_SEL_BLOCK 1024
 #define CASCADE_SEL_MAX   8192   // scores held in shared memory (32 KB)
