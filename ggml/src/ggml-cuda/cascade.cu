@@ -286,6 +286,12 @@ __global__ void cascade_expand_kernel(
     out[i] = (p < Vt) ? lt[p + (size_t) t*Vt] : ninf[0];
 }
 
+// CASCADE_CUDA_SKIP=sel0|up|sel1|down|reduce disables one stage at a time, for bisecting a fault
+static bool cascade_skip(const char * what) {
+    static const char * e = getenv("CASCADE_CUDA_SKIP");
+    return e != nullptr && strstr(e, what) != nullptr;
+}
+
 void ggml_cuda_op_cascade_up(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * g   = dst->src[0];
     const ggml_tensor * x   = dst->src[1];
@@ -307,15 +313,18 @@ void ggml_cuda_op_cascade_up(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
     cudaStream_t st = ctx.stream();
     const int shmem = (int) (F*sizeof(float));
 
+    if (!cascade_skip("sel0"))
     cascade_sel_kernel<true><<<1, CASCADE_SEL_BLOCK, shmem, st>>>(
         (const float *) g->data, act, (const int *) lsk, lst, F, c, F, c);
     CUDA_CHECK(cudaGetLastError());
 
+    if (!cascade_skip("up"))
     cascade_up_kernel<<<c, CASCADE_UP_BLOCK, 0, st>>>(
         (const char *) wu->data, (const __half *) wus->data,
         (const float *) x->data, (const float *) g->data, lst, act, D, c);
     CUDA_CHECK(cudaGetLastError());
 
+    if (!cascade_skip("sel1"))
     cascade_sel_kernel<false><<<1, CASCADE_SEL_BLOCK, (int) (c*sizeof(float)), st>>>(
         (const float *) g->data, act, (const int *) lst, lsk, F, c, c, k);
     CUDA_CHECK(cudaGetLastError());
@@ -336,11 +345,13 @@ void ggml_cuda_op_cascade_down(ggml_backend_cuda_context & ctx, ggml_tensor * ds
 
     cudaStream_t s = ctx.stream();
     const int F = (int) sel->ne[0];
+    if (!cascade_skip("down"))
     cascade_down_kernel<<<(D/128)*S, 128, 0, s>>>(
         (const char *) wt->data, (const __half *) st->data, list, act,
         (float *) sp->data, D, F, k, S);
     CUDA_CHECK(cudaGetLastError());
 
+    if (!cascade_skip("reduce"))
     cascade_down_reduce_kernel<<<(D + 255)/256, 256, 0, s>>>(
         (const float *) sp->data, (float *) dst->data, D, S);
     CUDA_CHECK(cudaGetLastError());
