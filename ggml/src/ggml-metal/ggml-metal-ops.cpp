@@ -4556,7 +4556,9 @@ int ggml_metal_op_cascade_up(ggml_metal_op_t ctx, int idx) {
 
     // gathered up dots for the candidates
     {
-        ggml_metal_kargs_cascade_up args = { (int32_t) F, (int32_t) D, (int32_t) (D/32), (cascade_ablate() & 4) != 0 };
+        ggml_metal_kargs_cascade_up args = { (int32_t) F, (int32_t) D, (int32_t) c, (int32_t) (D/32),
+                                             (cascade_ablate() & 4) != 0,
+                                             (getenv("LLAMA_CASCADE_UP_PREFIX") != nullptr) };
         const int per_tg = ntg_up / 32;
         ggml_metal_encoder_set_pipeline(enc, pipe_up);
         ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);

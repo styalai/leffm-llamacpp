@@ -292,7 +292,12 @@ kernel void kernel_cascade_up(
 
     const int per_tg = (int) (ntg / 32);
     const int j      = (int) (tgpig * per_tg + tpitg/32);
-    if (j >= F || mask[j] == 0) {
+    if (j >= F) {
+        return;
+    }
+    // LLAMA_CASCADE_UP_PREFIX: run the first c units and read their rows in order, so the same
+    // bytes and instructions arrive as one sequential sweep instead of a scattered gather.
+    if (args.prefix ? (j >= args.c) : (mask[j] == 0)) {
         return;
     }
     const uint lane = tpitg % 32;
