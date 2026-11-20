@@ -1594,62 +1594,82 @@ void llama_model::get_cascade_repack(int il, struct ggml_tensor ** w_t, struct g
         }
         cascade_bufs.push_back(buf);
 
+        // The transpose runs on the host and the result is uploaded through the backend: on CUDA
+        // both the source weights and the repack live in device memory, so the old direct writes
+        // into `t->data` were only valid on host-visible (Metal/CPU) buffers.
         const int64_t D = hparams.n_embd;
         for (int i = 0; i < n_layer; ++i) {
             const struct ggml_tensor * up_src = layers[i].ffn_up;
-            int8_t * wud = with_up ? (int8_t *) cascade_wu[i]->data : nullptr;
-            ggml_fp16_t * wsd = with_up ? (ggml_fp16_t *) cascade_wus[i]->data : nullptr;
+            const struct ggml_tensor * src    = layers[i].ffn_down;
+            const int64_t F = src->ne[0];
+            const size_t  blk_bytes = ggml_type_size(GGML_TYPE_Q8_0);   // 2-byte scale + 32 int8
+
+            std::vector<char> h_up, h_dn;
             if (with_up && up_src != nullptr && up_src->type == GGML_TYPE_Q8_0 && up_src->data != nullptr) {
-                const size_t blk = ggml_type_size(GGML_TYPE_Q8_0);   // 2-byte scale + 32 int8
-                for (int64_t j = 0; j < hparams.n_ff(i); ++j) {
-                    const char * rp = (const char *) up_src->data + (size_t) j*up_src->nb[1];
+                h_up.resize(ggml_nbytes(up_src));
+                ggml_backend_tensor_get(up_src, h_up.data(), 0, h_up.size());
+            }
+            h_dn.resize(ggml_nbytes(src));
+            ggml_backend_tensor_get(src, h_dn.data(), 0, h_dn.size());
+
+            std::vector<int8_t>      h_wu(with_up ? (size_t) F*D : 0);
+            std::vector<ggml_fp16_t> h_wus(with_up ? (size_t) F*(D/32) : 0);
+            std::vector<int8_t>      h_wt((size_t) F*D);
+            std::vector<float>       h_st(with_up ? 0 : (size_t) F*D/32);
+            std::vector<ggml_fp16_t> h_st16(with_up ? (size_t) (F/32)*D : 0);
+
+            if (with_up && !h_up.empty()) {
+                for (int64_t j = 0; j < F; ++j) {
+                    const char * rp = h_up.data() + (size_t) j*up_src->nb[1];
                     for (int64_t b = 0; b < D/32; ++b) {
                         ggml_fp16_t d16;
-                        memcpy(&d16, rp + b*blk, sizeof(d16));
-                        const float d = ggml_fp16_to_fp32(d16);
-                        const int8_t * qs = (const int8_t *) (rp + b*blk + sizeof(d16));
-                        wsd[(size_t) j*(D/32) + b] = d16;   // the source's own fp16 bits
+                        memcpy(&d16, rp + b*blk_bytes, sizeof(d16));
+                        const int8_t * qs = (const int8_t *) (rp + b*blk_bytes + sizeof(d16));
+                        h_wus[(size_t) j*(D/32) + b] = d16;      // the source's own fp16 bits
                         for (int t = 0; t < 32; ++t) {
-                            wud[(size_t) j*D + b*32 + t] = qs[t];
+                            h_wu[(size_t) j*D + b*32 + t] = qs[t];
                         }
                     }
                 }
             }
-            const struct ggml_tensor * src = layers[i].ffn_down;
-            const int64_t F = src->ne[0];
-            int8_t * wt = (int8_t *) cascade_wt[i]->data;
-            const size_t blk_bytes = ggml_type_size(GGML_TYPE_Q8_0);   // 2-byte scale + 32 int8
             if (with_up) {
-                ggml_fp16_t * st16 = (ggml_fp16_t *) cascade_st[i]->data;
                 for (int64_t o = 0; o < D; ++o) {
-                    const char * row = (const char *) src->data + o*src->nb[1];
+                    const char * row = h_dn.data() + o*src->nb[1];
                     for (int64_t jb = 0; jb < F/32; ++jb) {
                         const char * blk = row + (size_t) jb*blk_bytes;
                         ggml_fp16_t d16;
                         memcpy(&d16, blk, sizeof(d16));
-                        st16[(size_t) jb*D + o] = d16;
+                        h_st16[(size_t) jb*D + o] = d16;
                         const int8_t * qs = (const int8_t *) (blk + sizeof(d16));
                         for (int t = 0; t < 32; ++t) {
-                            wt[((size_t)(jb*32 + t))*D + o] = qs[t];
+                            h_wt[((size_t)(jb*32 + t))*D + o] = qs[t];
                         }
                     }
                 }
             } else {
-                float * st = (float *) cascade_st[i]->data;
                 for (int64_t o = 0; o < D; ++o) {
-                    const char * row = (const char *) src->data + o*src->nb[1];
+                    const char * row = h_dn.data() + o*src->nb[1];
                     for (int64_t jb = 0; jb < F/32; ++jb) {
                         const char * blk = row + (size_t) jb*blk_bytes;
                         ggml_fp16_t d16;
                         memcpy(&d16, blk, sizeof(d16));
-                        st[((size_t)(o/128)*(F/32) + jb)*128 + (o%128)] = ggml_fp16_to_fp32(d16);
+                        h_st[((size_t)(o/128)*(F/32) + jb)*128 + (o%128)] = ggml_fp16_to_fp32(d16);
                         const int8_t * qs = (const int8_t *) (blk + sizeof(d16));
                         for (int t = 0; t < 32; ++t) {
-                            wt[((size_t)(o/128)*F + (jb*32 + t))*128 + (o%128)] = qs[t];
+                            h_wt[((size_t)(o/128)*F + (jb*32 + t))*128 + (o%128)] = qs[t];
                         }
                     }
                 }
             }
+
+            if (with_up) {
+                ggml_backend_tensor_set(cascade_wu[i],  h_wu.data(),   0, h_wu.size());
+                ggml_backend_tensor_set(cascade_wus[i], h_wus.data(),  0, h_wus.size()*sizeof(ggml_fp16_t));
+                ggml_backend_tensor_set(cascade_st[i],  h_st16.data(), 0, h_st16.size()*sizeof(ggml_fp16_t));
+            } else {
+                ggml_backend_tensor_set(cascade_st[i],  h_st.data(),   0, h_st.size()*sizeof(float));
+            }
+            ggml_backend_tensor_set(cascade_wt[i], h_wt.data(), 0, h_wt.size());
         }
     }
     if ((int) cascade_wt.size() == (int) layers.size()) {
@@ -1729,23 +1749,51 @@ void llama_model::load_tensors_cascade() {
     }
     cascade_bufs.push_back(buf);
 
-    int8_t * wdst = (int8_t *) w->data;
-    int32_t * invd = (int32_t *) idxs->data;
-    int32_t * evd  = (int32_t *) einv->data;
-    for (int64_t v = 0; v < n_vocab; ++v) {
-        invd[v] = (int32_t) Vt;   // sentinel: the -inf row
-        evd [v] = 0;              // dropped ids must never appear in a prompt; row 0 keeps it in bounds
-    }
+    // host staging + backend upload, so this also works when the weights live in device memory
+    std::vector<char>    h_src(ggml_nbytes(src));
+    ggml_backend_tensor_get(src, h_src.data(), 0, h_src.size());
+
+    std::vector<int8_t>  h_w((size_t) row_bytes*Vt);
+    std::vector<int32_t> h_inv(n_vocab, (int32_t) Vt);   // sentinel: the -inf row
+    std::vector<int32_t> h_einv(n_vocab, 0);             // dropped ids -> row 0, stays in bounds
+
     for (int64_t i = 0; i < Vt; ++i) {
         const int32_t id = ids[i];
         if (id < 0 || id >= n_vocab) {
             continue;
         }
-        memcpy(wdst + i*row_bytes, (const char *) src->data + (size_t) id*src->nb[1], row_bytes);
-        invd[id] = (int32_t) i;
-        evd [id] = (int32_t) i;
+        memcpy(h_w.data() + i*row_bytes, h_src.data() + (size_t) id*src->nb[1], row_bytes);
+        h_inv[id]  = (int32_t) i;
+        h_einv[id] = (int32_t) i;
     }
-    ((float *) ninf->data)[0] = -INFINITY;
+    ggml_backend_tensor_set(w,    h_w.data(),    0, h_w.size());
+    ggml_backend_tensor_set(idxs, h_inv.data(),  0, h_inv.size()*sizeof(int32_t));
+    ggml_backend_tensor_set(einv, h_einv.data(), 0, h_einv.size()*sizeof(int32_t));
+
+    const float ninf_v = -INFINITY;
+    ggml_backend_tensor_set(ninf, &ninf_v, 0, sizeof(float));
+
+    if (getenv("LLAMA_CASCADE_DEBUG_HEAD") != nullptr) {
+        std::vector<int8_t>  chk_w(row_bytes);
+        std::vector<int32_t> chk_inv(n_vocab), chk_einv(n_vocab);
+        float chk_ninf = 0.0f;
+        ggml_backend_tensor_get(w,    chk_w.data(),    0, row_bytes);
+        ggml_backend_tensor_get(idxs, chk_inv.data(),  0, chk_inv.size()*sizeof(int32_t));
+        ggml_backend_tensor_get(einv, chk_einv.data(), 0, chk_einv.size()*sizeof(int32_t));
+        ggml_backend_tensor_get(ninf, &chk_ninf,       0, sizeof(float));
+        for (int64_t i : { (int64_t) 0, (int64_t) 1, (int64_t) 100, Vt/2, Vt - 1 }) {
+            std::vector<int8_t> a(row_bytes), b(row_bytes);
+            ggml_backend_tensor_get(w, a.data(), (size_t) i*row_bytes, row_bytes);
+            memcpy(b.data(), h_src.data() + (size_t) ids[i]*src->nb[1], row_bytes);
+            fprintf(stderr, "%s: row %lld (id %d) %s\n", __func__, (long long) i, ids[i],
+                    memcmp(a.data(), b.data(), row_bytes) == 0 ? "OK" : "MISMATCH");
+        }
+        fprintf(stderr, "%s: readback w[0] %s, inv matches %s, einv matches %s, ninf %g\n", __func__,
+                memcmp(chk_w.data(), h_w.data(), row_bytes) == 0 ? "OK" : "MISMATCH",
+                memcmp(chk_inv.data(),  h_inv.data(),  h_inv.size()*sizeof(int32_t)) == 0 ? "OK" : "MISMATCH",
+                memcmp(chk_einv.data(), h_einv.data(), h_einv.size()*sizeof(int32_t)) == 0 ? "OK" : "MISMATCH",
+                (double) chk_ninf);
+    }
 
     cascade_head_w    = w;
     cascade_head_idx  = idxs;

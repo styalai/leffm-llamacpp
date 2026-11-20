@@ -23,6 +23,7 @@
 #include "ggml-cuda/convert.cuh"
 #include "ggml-cuda/count-equal.cuh"
 #include "ggml-cuda/cpy.cuh"
+#include "cascade.cuh"
 #include "ggml-cuda/cross-entropy-loss.cuh"
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/diag.cuh"
@@ -3009,6 +3010,15 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_SCALE:
             ggml_cuda_op_scale(ctx, dst);
+            break;
+        case GGML_OP_CASCADE_UP:
+            ggml_cuda_op_cascade_up(ctx, dst);
+            break;
+        case GGML_OP_CASCADE_DOWN:
+            ggml_cuda_op_cascade_down(ctx, dst);
+            break;
+        case GGML_OP_CASCADE_EXPAND:
+            ggml_cuda_op_cascade_expand(ctx, dst);
             break;
         case GGML_OP_SQR:
             ggml_cuda_op_sqr(ctx, dst);
@@ -6682,6 +6692,15 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_COS:
         case GGML_OP_LOG:
             return true;
+        case GGML_OP_CASCADE_UP:
+            return op->src[3] != nullptr && op->src[3]->type == GGML_TYPE_I8 && op->src[4] != nullptr &&
+                   op->src[0]->ne[0] <= 8192;
+        case GGML_OP_CASCADE_DOWN:
+            return op->src[2] != nullptr && op->src[2]->type == GGML_TYPE_I8 && op->src[2]->ne[1] > 1 &&
+                   op->src[3] != nullptr && op->src[3]->type == GGML_TYPE_F16 && op->src[4] != nullptr;
+        case GGML_OP_CASCADE_EXPAND:
+            return op->src[0]->type == GGML_TYPE_F32 && op->src[1] != nullptr &&
+                   op->src[1]->type == GGML_TYPE_I32 && op->src[2] != nullptr;
         case GGML_OP_SCALE:
             return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_BF16) && op->type == op->src[0]->type &&
                    ggml_is_contiguous_rows(op->src[0]);
