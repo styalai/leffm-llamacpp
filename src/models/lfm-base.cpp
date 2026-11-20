@@ -157,6 +157,12 @@ ggml_tensor * llm_build_lfm_base::build_lfm_dense_ffn(ggml_tensor * cur,
         if (e != nullptr && strstr(e, "ffn") != nullptr) {
             return cur;
         }
+        // ... or only the first n layers, for a linearity check on the ablation deltas
+        static const int skip_layers = getenv("LLAMA_CASCADE_SKIP_FFN_LAYERS")
+                                     ? atoi(getenv("LLAMA_CASCADE_SKIP_FFN_LAYERS")) : 0;
+        if (il < skip_layers) {
+            return cur;
+        }
     }
     int cascade_c = 0, cascade_k = 0;
     if (cur->ne[1] == 1 && cur->ne[2] == 1 && cur->ne[3] == 1 && lfm_cascade_cfg(cascade_c, cascade_k)) {
