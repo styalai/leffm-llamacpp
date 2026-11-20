@@ -4539,7 +4539,7 @@ int ggml_metal_op_cascade_up(ggml_metal_op_t ctx, int idx) {
     ggml_metal_buffer_id bid_mf   = { bid_sel.metal, bid_sel.offs + 2*sel->nb[1] };
 
     const int ntg_sel = 512;
-    const int ntg_up  = 128;
+    const int ntg_up  = 128;   // 4 simdgroups x 2 units per simdgroup = 8 units per threadgroup
 
     // selection, stage 0: scores from g -> mask1
     {
@@ -4559,7 +4559,7 @@ int ggml_metal_op_cascade_up(ggml_metal_op_t ctx, int idx) {
         ggml_metal_kargs_cascade_up args = { (int32_t) F, (int32_t) D, (int32_t) c, (int32_t) (D/32),
                                              (cascade_ablate() & 4) != 0,
                                              (getenv("LLAMA_CASCADE_UP_PREFIX") != nullptr) };
-        const int per_tg = ntg_up / 32;
+        const int per_tg = (ntg_up / 32) * 2;
         ggml_metal_encoder_set_pipeline(enc, pipe_up);
         ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
         // indices follow the MSL declaration order: args(0), wu(1), wus(2), x(3), g(4), mask(5), act(6)

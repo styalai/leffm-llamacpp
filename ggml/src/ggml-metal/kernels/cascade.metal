@@ -290,62 +290,76 @@ kernel void kernel_cascade_up(
     const int D  = args.D;
     const int NB = args.NB;   // scale blocks per unit (D/32)
 
-    const int per_tg = (int) (ntg / 32);
-    const int j      = (int) (tgpig * per_tg + tpitg/32);
-    if (j >= F) {
+    // Two candidate units per simdgroup: 2 x 4 KB rows interleaved gives 32 weight loads in flight
+    // per lane step instead of 16, and the 32-value x block is loaded once and reused by both.
+    const int warp = (int) (tpitg / 32);
+    const int lane = (int) (tpitg % 32);
+    const int per_tg = (int) (ntg / 32) * 2;
+    const int j0 = (int) tgpig * per_tg + warp * 2;
+    const int j1 = j0 + 1;
+
+    const bool a0 = j0 < F && (args.prefix ? j0 < args.c : mask[j0] != 0);
+    const bool a1 = j1 < F && (args.prefix ? j1 < args.c : mask[j1] != 0);
+    if (!a0 && !a1) {
         return;
     }
-    // LLAMA_CASCADE_UP_PREFIX: run the first c units and read their rows in order, so the same
-    // bytes and instructions arrive as one sequential sweep instead of a scattered gather.
-    if (args.prefix ? (j >= args.c) : (mask[j] == 0)) {
-        return;
-    }
-    const uint lane = tpitg % 32;
 
-    // int8 unit-major row: one lane per 32-value block, so a lane reads 32 contiguous bytes
-    // (8 x char4) and applies one scale. D/32 == 64 blocks give every lane two of them, and the
-    // two blocks' loads are interleaved so both are in flight.
-    device const char  * wr  = wu  + (size_t) j*D;
-    device const float * wsr = wus + (size_t) j*NB;
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
 
-    float acc = 0.0f;
-    for (int b = (int) lane; b < NB; b += 32) {
-        const int  b2  = b + 32;
-        const bool two = (b2 < NB);
-        // four 8-value chunk sums per 32-value block, each scaled by the block's d before it is
-        // accumulated -- the same granularity kernel_mul_mv_q8_0_f32 uses, so the gathered dot
-        // tracks the dense matmul as closely as the fp32 accumulation order allows
-        float p0 = 0.0f, p1 = 0.0f, p2 = 0.0f, p3 = 0.0f;
-        float q0 = 0.0f, q1 = 0.0f, q2 = 0.0f, q3 = 0.0f;
-        for (int t = 0; t < 32; t += 4) {
-            const char4  v  = *(device const char4  *) (wr + b*32 + t);
-            const float4 xv = *(device const float4 *) (x  + b*32 + t);
-            const float  pv = xv.x*(float) v.x + xv.y*(float) v.y + xv.z*(float) v.z + xv.w*(float) v.w;
-            if      (t <  8) { p0 += pv; }
-            else if (t < 16) { p1 += pv; }
-            else if (t < 24) { p2 += pv; }
-            else             { p3 += pv; }
-            if (two) {
-                const char4  u  = *(device const char4  *) (wr + b2*32 + t);
-                const float4 yv = *(device const float4 *) (x  + b2*32 + t);
-                const float  qv = yv.x*(float) u.x + yv.y*(float) u.y + yv.z*(float) u.z + yv.w*(float) u.w;
-                if      (t <  8) { q0 += qv; }
-                else if (t < 16) { q1 += qv; }
-                else if (t < 24) { q2 += qv; }
-                else             { q3 += qv; }
+    if (a0 && a1) {
+        device const char  * wr0 = wu  + (size_t) j0*D;
+        device const char  * wr1 = wu  + (size_t) j1*D;
+        device const float * ws0 = wus + (size_t) j0*NB;
+        device const float * ws1 = wus + (size_t) j1*NB;
+        for (int b = (int) lane; b < NB; b += 32) {
+            float p0 = 0.0f, p1 = 0.0f, p2 = 0.0f, p3 = 0.0f;
+            float q0 = 0.0f, q1 = 0.0f, q2 = 0.0f, q3 = 0.0f;
+            for (int t = 0; t < 32; t += 4) {
+                const float4 xv = *(device const float4 *) (x   + b*32 + t);
+                const char4  v  = *(device const char4  *) (wr0 + b*32 + t);
+                const char4  w  = *(device const char4  *) (wr1 + b*32 + t);
+                const float  pv = xv.x*(float) v.x + xv.y*(float) v.y + xv.z*(float) v.z + xv.w*(float) v.w;
+                const float  qv = xv.x*(float) w.x + xv.y*(float) w.y + xv.z*(float) w.z + xv.w*(float) w.w;
+                if      (t <  8) { p0 += pv; q0 += qv; }
+                else if (t < 16) { p1 += pv; q1 += qv; }
+                else if (t < 24) { p2 += pv; q2 += qv; }
+                else             { p3 += pv; q3 += qv; }
             }
+            acc0 += (p0 + p1 + p2 + p3) * ws0[b];
+            acc1 += (q0 + q1 + q2 + q3) * ws1[b];
         }
-        const float db = wsr[b];
-        acc += (p0 + p1 + p2 + p3) * db;
-        if (two) {
-            const float db2 = wsr[b2];
-            acc += (q0 + q1 + q2 + q3) * db2;
+    } else {
+        const int j = a0 ? j0 : j1;
+        device const char  * wr = wu  + (size_t) j*D;
+        device const float * ws = wus + (size_t) j*NB;
+        for (int b = (int) lane; b < NB; b += 32) {
+            float p0 = 0.0f, p1 = 0.0f, p2 = 0.0f, p3 = 0.0f;
+            for (int t = 0; t < 32; t += 4) {
+                const float4 xv = *(device const float4 *) (x  + b*32 + t);
+                const char4  v  = *(device const char4  *) (wr + b*32 + t);
+                const float  pv = xv.x*(float) v.x + xv.y*(float) v.y + xv.z*(float) v.z + xv.w*(float) v.w;
+                if      (t <  8) { p0 += pv; }
+                else if (t < 16) { p1 += pv; }
+                else if (t < 24) { p2 += pv; }
+                else             { p3 += pv; }
+            }
+            acc0 += (p0 + p1 + p2 + p3) * ws[b];
         }
     }
-    acc = simd_sum(acc);
+
+    // warp-collective: every lane must participate, so reduce before the lane-0 store
+    const float s0 = simd_sum(acc0);
+    const float s1 = simd_sum(acc1);
 
     if (lane == 0) {
-        const float gv = g[j];
-        act[j] = (gv / (1.0f + exp(-gv))) * acc;
+        if (a0) {
+            const float gv = g[j0];
+            act[j0] = (gv / (1.0f + exp(-gv))) * s0;
+        }
+        if (a1) {
+            const float gv = g[j1];
+            act[j1] = (gv / (1.0f + exp(-gv))) * s1;
+        }
     }
 }
