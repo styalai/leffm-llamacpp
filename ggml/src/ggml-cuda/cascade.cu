@@ -79,6 +79,8 @@ __global__ void cascade_sel_kernel(
     const int nt  = blockDim.x;
     const int per = (nin + nt - 1) / nt;
 
+    // the block covers nt*per >= nin slots and only [0, nin) exists in shared memory: the padding
+    // must not be written (every later read is guarded by t < nin)
     for (int i = 0; i < per; ++i) {
         const int t = tid*per + i;
         if (t < nin) {
@@ -88,8 +90,6 @@ __global__ void cascade_sel_kernel(
             } else {
                 s[t] = fabsf(act[(int) list_in[t]]);
             }
-        } else {
-            s[t] = 0.0f;
         }
     }
     __syncthreads();
