@@ -164,7 +164,11 @@ llama_model_lfm3::graph<decision>::graph(const llm_graph_params & params) :
         cur = build_norm(cur, model.layers[il].attn_norm, NULL, LLM_NORM_RMS, il);
         cb(cur, "model.layers.{}.operator_norm", il);
 
-        if (hparams.is_recr(il)) {
+        if (lfm_skip("conv") || lfm_skip("attn")) {
+            // timing ablation: skip the attention/conv operator entirely (no compute)
+            cur = ggml_view_2d(ctx0, cur, cur->ne[0], cur->ne[1], cur->nb[1], 0);
+            cb(cur, "model.layers.{}.operator_skipped", il);
+        } else if (hparams.is_recr(il)) {
             if constexpr (decision) {
                 cur = build_lfm_shortconv(cur, il);
             } else {
@@ -233,6 +237,10 @@ llama_model_lfm3::graph<decision>::graph(const llm_graph_params & params) :
                     ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, cur->ne[1], model.vocab.n_tokens()));
             struct ggml_tensor * out_t = ggml_set_rows(ctx0, fill_t, lt_t, idx_t);   // [T, n_vocab]
             cur = ggml_cont(ctx0, ggml_transpose(ctx0, out_t));                     // [n_vocab, T]
+            cb(cur, "result_output", -1);
+        } else if (lfm_skip("head")) {
+            cur = ggml_repeat(ctx0, ggml_view_1d(ctx0, cur, 1, 0),
+                    ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, cur->ne[1], model.vocab.n_tokens()));
             cb(cur, "result_output", -1);
         } else {
             cur = build_lora_mm(model.output, cur, model.output_s);

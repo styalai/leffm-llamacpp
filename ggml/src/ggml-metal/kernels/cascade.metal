@@ -275,7 +275,7 @@ kernel void kernel_cascade_sel(
 kernel void kernel_cascade_up(
         constant ggml_metal_kargs_cascade_up & args,
         device const char  * wu,       // int8 unit-major [F, D]
-        device const float * wus,      // per-32-block scales [F, D/32]
+        device const half  * wus,      // per-32-block scales [F, D/32], fp16 as in the source
         device const float * x,        // [D]
         device const float * g,        // [F]
         device const uchar * mask,     // [F]
@@ -310,8 +310,8 @@ kernel void kernel_cascade_up(
     if (a0 && a1) {
         device const char  * wr0 = wu  + (size_t) j0*D;
         device const char  * wr1 = wu  + (size_t) j1*D;
-        device const float * ws0 = wus + (size_t) j0*NB;
-        device const float * ws1 = wus + (size_t) j1*NB;
+        device const half  * ws0 = wus + (size_t) j0*NB;
+        device const half  * ws1 = wus + (size_t) j1*NB;
         for (int b = (int) lane; b < NB; b += 32) {
             float p0 = 0.0f, p1 = 0.0f, p2 = 0.0f, p3 = 0.0f;
             float q0 = 0.0f, q1 = 0.0f, q2 = 0.0f, q3 = 0.0f;
@@ -326,13 +326,13 @@ kernel void kernel_cascade_up(
                 else if (t < 24) { p2 += pv; q2 += qv; }
                 else             { p3 += pv; q3 += qv; }
             }
-            acc0 += (p0 + p1 + p2 + p3) * ws0[b];
-            acc1 += (q0 + q1 + q2 + q3) * ws1[b];
+            acc0 += (p0 + p1 + p2 + p3) * (float) ws0[b];
+            acc1 += (q0 + q1 + q2 + q3) * (float) ws1[b];
         }
     } else {
         const int j = a0 ? j0 : j1;
         device const char  * wr = wu  + (size_t) j*D;
-        device const float * ws = wus + (size_t) j*NB;
+        device const half  * ws = wus + (size_t) j*NB;
         for (int b = (int) lane; b < NB; b += 32) {
             float p0 = 0.0f, p1 = 0.0f, p2 = 0.0f, p3 = 0.0f;
             for (int t = 0; t < 32; t += 4) {
@@ -344,7 +344,7 @@ kernel void kernel_cascade_up(
                 else if (t < 24) { p2 += pv; }
                 else             { p3 += pv; }
             }
-            acc0 += (p0 + p1 + p2 + p3) * ws[b];
+            acc0 += (p0 + p1 + p2 + p3) * (float) ws[b];
         }
     }
 

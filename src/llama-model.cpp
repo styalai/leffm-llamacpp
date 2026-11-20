@@ -1537,7 +1537,7 @@ void llama_model::get_cascade_repack(int il, struct ggml_tensor ** w_t, struct g
                      (with_up ? sizeof(ggml_fp16_t) : sizeof(float));               // scales
             if (with_up) {
                 total += (size_t) hparams.n_embd * hparams.n_ff(i);                        // up, int8
-                total += (size_t) hparams.n_ff(i) * (size_t) hparams.n_embd / 32 * sizeof(float); // up scales
+                total += (size_t) hparams.n_ff(i) * (size_t) hparams.n_embd / 32 * sizeof(ggml_fp16_t); // up scales
             }
         }
         if (!ok) {
@@ -1567,7 +1567,7 @@ void llama_model::get_cascade_repack(int il, struct ggml_tensor ** w_t, struct g
             if (with_up) {
                 cascade_wu[i] = ggml_new_tensor_2d(ctx, GGML_TYPE_I8,
                                                    hparams.n_embd, hparams.n_ff(i));   // unit-major
-                cascade_wus[i] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,
+                cascade_wus[i] = ggml_new_tensor_2d(ctx, GGML_TYPE_F16,
                                                     hparams.n_embd / 32, hparams.n_ff(i));
             }
             if (cascade_wt[i] == nullptr || cascade_st[i] == nullptr ||
@@ -1598,7 +1598,7 @@ void llama_model::get_cascade_repack(int il, struct ggml_tensor ** w_t, struct g
         for (int i = 0; i < n_layer; ++i) {
             const struct ggml_tensor * up_src = layers[i].ffn_up;
             int8_t * wud = with_up ? (int8_t *) cascade_wu[i]->data : nullptr;
-            float  * wsd = with_up ? (float  *) cascade_wus[i]->data : nullptr;
+            ggml_fp16_t * wsd = with_up ? (ggml_fp16_t *) cascade_wus[i]->data : nullptr;
             if (with_up && up_src != nullptr && up_src->type == GGML_TYPE_Q8_0 && up_src->data != nullptr) {
                 const size_t blk = ggml_type_size(GGML_TYPE_Q8_0);   // 2-byte scale + 32 int8
                 for (int64_t j = 0; j < hparams.n_ff(i); ++j) {
@@ -1608,7 +1608,7 @@ void llama_model::get_cascade_repack(int il, struct ggml_tensor ** w_t, struct g
                         memcpy(&d16, rp + b*blk, sizeof(d16));
                         const float d = ggml_fp16_to_fp32(d16);
                         const int8_t * qs = (const int8_t *) (rp + b*blk + sizeof(d16));
-                        wsd[(size_t) j*(D/32) + b] = d;
+                        wsd[(size_t) j*(D/32) + b] = d16;   // the source's own fp16 bits
                         for (int t = 0; t < 32; ++t) {
                             wud[(size_t) j*D + b*32 + t] = qs[t];
                         }
