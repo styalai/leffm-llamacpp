@@ -167,6 +167,7 @@ __global__ void cascade_up_kernel(
         const float * __restrict__ list,   // [c] candidate unit ids
         float       * __restrict__ act,    // [F]
         const int D,
+        const int F,
         const int c) {
     const int idx = blockIdx.x;
     if (idx >= c) {
@@ -324,7 +325,7 @@ void ggml_cuda_op_cascade_up(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
     if (!cascade_skip("up"))
     cascade_up_kernel<<<c, CASCADE_UP_BLOCK, 0, st>>>(
         (const char *) wu->data, (const __half *) wus->data,
-        (const float *) x->data, (const float *) g->data, lst, act, D, c);
+        (const float *) x->data, (const float *) g->data, lst, act, D, F, c);
     CUDA_CHECK(cudaGetLastError());
 
     if (!cascade_skip("sel1"))
