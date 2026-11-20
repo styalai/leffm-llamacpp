@@ -1701,6 +1701,8 @@ void llama_model::load_tensors_cascade() {
     // its row in the kept matrix (or Vt, the -inf sentinel row). One scatter per token of Vt
     // single floats was costing ~1.6 ms; a gather is coalesced.
     struct ggml_tensor * ninf = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);         // -inf sentinel
+    // [1, V] so get_rows can gather entries along ne1 by token id
+    struct ggml_tensor * einv = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, n_vocab);
 
     // put the cut head and its id map in the *same* buffer type as the weights: a CPU-resident map
     // forces a device->host copy plus a sync per token, and the expand op then falls back to CPU
@@ -1715,12 +1717,12 @@ void llama_model::load_tensors_cascade() {
         ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
         buft = ggml_backend_dev_buffer_type(dev);
     }
-    const size_t total = row_bytes*Vt + sizeof(int32_t)*n_vocab + sizeof(float);
+    const size_t total = row_bytes*Vt + sizeof(int32_t)*n_vocab + sizeof(float) + sizeof(int32_t)*n_vocab;
     ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(buft, total);
     ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
     char * bbase = (char *) ggml_backend_buffer_get_base(buf);
     size_t off = 0;
-    for (struct ggml_tensor * t : { w, idxs, ninf }) {
+    for (struct ggml_tensor * t : { w, idxs, ninf, einv }) {
         t->data   = bbase + off;
         t->buffer = buf;
         off += ggml_nbytes(t);
@@ -1729,8 +1731,10 @@ void llama_model::load_tensors_cascade() {
 
     int8_t * wdst = (int8_t *) w->data;
     int32_t * invd = (int32_t *) idxs->data;
+    int32_t * evd  = (int32_t *) einv->data;
     for (int64_t v = 0; v < n_vocab; ++v) {
         invd[v] = (int32_t) Vt;   // sentinel: the -inf row
+        evd [v] = 0;              // dropped ids must never appear in a prompt; row 0 keeps it in bounds
     }
     for (int64_t i = 0; i < Vt; ++i) {
         const int32_t id = ids[i];
@@ -1739,15 +1743,25 @@ void llama_model::load_tensors_cascade() {
         }
         memcpy(wdst + i*row_bytes, (const char *) src->data + (size_t) id*src->nb[1], row_bytes);
         invd[id] = (int32_t) i;
+        evd [id] = (int32_t) i;
     }
     ((float *) ninf->data)[0] = -INFINITY;
 
     cascade_head_w    = w;
     cascade_head_idx  = idxs;
     cascade_head_base = ninf;
+    cascade_head_einv = einv;
     cascade_head_done = true;
     fprintf(stderr, "%s: head cut to %lld of %lld ids (%.1f MB)\n", __func__,
             (long long) Vt, (long long) n_vocab, row_bytes*Vt/1e6);
+}
+
+void llama_model::get_cascade_embed(struct ggml_tensor ** w_out, struct ggml_tensor ** einv_out) const {
+    struct ggml_tensor * dummy_w = nullptr;
+    struct ggml_tensor * dummy_i = nullptr;
+    get_cascade_head(&dummy_w, &dummy_i, &dummy_i);
+    *w_out    = cascade_head_w    != nullptr && cascade_head_einv != nullptr ? cascade_head_w    : nullptr;
+    *einv_out = cascade_head_einv != nullptr ? cascade_head_einv : nullptr;
 }
 
 void llama_model::get_cascade_head(struct ggml_tensor ** w_out, struct ggml_tensor ** idx_out,

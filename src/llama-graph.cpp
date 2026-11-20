@@ -2802,7 +2802,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 }
 
 // input embeddings with optional lora
-ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float tok_scale) const {
+ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float tok_scale,
+                                                ggml_tensor * trim_w, ggml_tensor * trim_inv) const {
     const int64_t n_embd_inp = hparams.n_embd_inp();
     const int64_t n_embd     = hparams.n_embd;
 
@@ -2846,7 +2847,16 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float to
     // we use ggml_build_forward_order to make the GET_ROWS ops stick at the beginning of the compute graph
     // this way the embeddings remain in the host buffer, and the GET_ROWS run before any other computations
     {
-        embd0 = ggml_get_rows(ctx0, tok_embd, inp->tokens);
+        if (trim_w != nullptr && trim_inv != nullptr) {
+            // vocabulary cut: the tied table is gathered to the kept ids, so a prompt token's row is
+            // the inverse-map entry of its id. Dropped ids map to row 0 (they must be filtered
+            // upstream); this keeps the lookup in bounds instead of reading past the matrix.
+            ggml_tensor * rows = ggml_get_rows(ctx0, trim_inv, inp->tokens);          // [1, n_tokens]
+            rows = ggml_reshape_1d(ctx0, rows, inp->tokens->ne[0]);
+            embd0 = ggml_get_rows(ctx0, trim_w, rows);
+        } else {
+            embd0 = ggml_get_rows(ctx0, tok_embd, inp->tokens);
+        }
         ggml_build_forward_order(gf, embd0);
 
         embd1 = inp->embd;

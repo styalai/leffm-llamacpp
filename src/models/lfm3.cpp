@@ -144,7 +144,9 @@ llama_model_lfm3::graph<decision>::graph(const llm_graph_params & params) :
         return out;
     };
 
-    ggml_tensor * cur = build_inp_embd(model.tok_embd);
+    struct ggml_tensor * trim_w = nullptr, * trim_inv = nullptr;
+    model.get_cascade_embed(&trim_w, &trim_inv);
+    ggml_tensor * cur = build_inp_embd(model.tok_embd, 1.0f, trim_w, trim_inv);
     cb(cur, "model.embed_tokens", -1);
 
     ggml_build_forward_expand(gf, cur);

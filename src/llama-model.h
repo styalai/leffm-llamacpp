@@ -995,6 +995,7 @@ struct llama_model {
 
     // LFM3 cascade FFN: lazily built unit-major repack of ffn_down (Q8_0 only, lossless)
     void get_cascade_repack(int il, struct ggml_tensor ** w_t, struct ggml_tensor ** s_t) const;
+    void get_cascade_embed(struct ggml_tensor ** w_out, struct ggml_tensor ** einv_out) const;
     void get_cascade_head(struct ggml_tensor ** w_out, struct ggml_tensor ** idx_out,
                           struct ggml_tensor ** base_out) const;
     struct ggml_tensor * get_cascade_up_w(int il) const;
@@ -1015,6 +1016,7 @@ struct llama_model {
     mutable struct ggml_tensor * cascade_head_w    = nullptr;
     mutable struct ggml_tensor * cascade_head_idx  = nullptr;
     mutable struct ggml_tensor * cascade_head_base = nullptr;
+    mutable struct ggml_tensor * cascade_head_einv = nullptr;   // embedding map: dropped ids -> row 0
 
     // for keeping track of associated LoRA adapters
     std::unordered_set<llama_adapter_lora *> loras;
