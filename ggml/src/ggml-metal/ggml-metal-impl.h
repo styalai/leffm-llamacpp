@@ -1478,7 +1478,8 @@ typedef struct {
 
 typedef struct {
     int32_t F;      // number of units
-    int32_t c;      // count to keep
+    int32_t nin;    // candidates scored (F for stage 0, c for stage 1)
+    int32_t target; // selection target (c for stage 0, k for stage 1)
     int32_t stage;  // 0: score from g, 1: score from act
     int32_t ablate; // 1 = skip (timing ablation)
 } ggml_metal_kargs_cascade_sel;

@@ -4540,20 +4540,21 @@ int ggml_metal_op_cascade_up(ggml_metal_op_t ctx, int idx) {
     ggml_metal_buffer_id bid_sel  = ggml_metal_get_buffer_id(sel);
     ggml_metal_buffer_id bid_act  = { bid_sel.metal, bid_sel.offs              };
     ggml_metal_buffer_id bid_m1   = { bid_sel.metal, bid_sel.offs + sel->nb[1] };
-    ggml_metal_buffer_id bid_mf   = { bid_sel.metal, bid_sel.offs + 2*sel->nb[1] };
+    ggml_metal_buffer_id bid_mf   = { bid_sel.metal, bid_sel.offs + 2*sel->nb[1] };   // stage-2 list
+    ggml_metal_buffer_id bid_lc   = { bid_sel.metal, bid_sel.offs + 3*sel->nb[1] };   // stage-1 list
 
     const int ntg_sel = 512;
     const int ntg_up  = 512;   // 4 simdgroups x 2 units per simdgroup = 8 units per threadgroup
 
     // selection, stage 0: scores from g -> mask1
     {
-        ggml_metal_kargs_cascade_sel args = { (int32_t) F, (int32_t) c, 0, (cascade_ablate() & 1) || (cascade_ablate() & 2) };
+        ggml_metal_kargs_cascade_sel args = { (int32_t) F, (int32_t) F, (int32_t) c, 0, (cascade_ablate() & 1) || (cascade_ablate() & 2) };
         ggml_metal_encoder_set_pipeline(enc, pipe_sel);
         ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(g), 1);
         ggml_metal_encoder_set_buffer  (enc, bid_act, 2);
-        ggml_metal_encoder_set_buffer  (enc, bid_m1,  3);
-        ggml_metal_encoder_set_buffer  (enc, bid_m1,  4);
+        ggml_metal_encoder_set_buffer  (enc, bid_lc,  3);   // candidates (unused by stage 0)
+        ggml_metal_encoder_set_buffer  (enc, bid_lc,  4);   // ... written as the candidate list
         ggml_metal_encoder_dispatch_threadgroups(enc, 1, 1, 1, ntg_sel, 1, 1);
         // LLAMA_CASCADE_EXTRA_DISP: repeat this (idempotent) dispatch to measure the cost of one
         static const int extra = getenv("LLAMA_CASCADE_EXTRA_DISP") ? atoi(getenv("LLAMA_CASCADE_EXTRA_DISP")) : 0;
@@ -4576,9 +4577,9 @@ int ggml_metal_op_cascade_up(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(wus), 2);
         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(x),   3);
         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(g),   4);
-        ggml_metal_encoder_set_buffer  (enc, bid_m1,  5);
+        ggml_metal_encoder_set_buffer  (enc, bid_lc,  5);   // candidate list
         ggml_metal_encoder_set_buffer  (enc, bid_act, 6);
-        ggml_metal_encoder_dispatch_threadgroups(enc, (int) ((F + per_tg - 1)/per_tg), 1, 1, ntg_up, 1, 1);
+        ggml_metal_encoder_dispatch_threadgroups(enc, (int) ((c + per_tg - 1)/per_tg), 1, 1, ntg_up, 1, 1);
     }
     ggml_metal_encoder_memory_barrier(enc);
     {   // LLAMA_CASCADE_EXTRA_BAR: insert N-1 extra barriers to price one barrier
@@ -4590,13 +4591,13 @@ int ggml_metal_op_cascade_up(ggml_metal_op_t ctx, int idx) {
 
     // selection, stage 1: |act| among the candidates -> final mask
     {
-        ggml_metal_kargs_cascade_sel args = { (int32_t) F, (int32_t) k, 1, (cascade_ablate() & 1) || (cascade_ablate() & 2) };
+        ggml_metal_kargs_cascade_sel args = { (int32_t) F, (int32_t) c, (int32_t) k, 1, (cascade_ablate() & 1) || (cascade_ablate() & 2) };
         ggml_metal_encoder_set_pipeline(enc, pipe_sel);
         ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(g), 1);
         ggml_metal_encoder_set_buffer  (enc, bid_act, 2);
-        ggml_metal_encoder_set_buffer  (enc, bid_m1,  3);
-        ggml_metal_encoder_set_buffer  (enc, bid_mf,  4);   // float list for stage 1
+        ggml_metal_encoder_set_buffer  (enc, bid_lc,  3);   // candidates
+        ggml_metal_encoder_set_buffer  (enc, bid_mf,  4);   // selected list
         ggml_metal_encoder_dispatch_threadgroups(enc, 1, 1, 1, ntg_sel, 1, 1);
     }
 

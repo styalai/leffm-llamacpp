@@ -152,32 +152,37 @@ kernel void kernel_cascade_down_reduce(
 // reduction), so no atomics and no grid-wide sync are needed.
 kernel void kernel_cascade_sel(
         constant ggml_metal_kargs_cascade_sel & args,
-        device const float * g,        // [F] gate pre-activations (stage 0)
-        device const float * act,      // [F] activations         (stage 1)
-        device const uchar * mask1,    // [F] stage-1 selection   (stage 1)
-        device       float * list,     // [k] ascending unit ids  (stage 1 output)
+        device const float * g,        // [F] gate pre-activations (stage 0 scores)
+        device const float * act,      // [F] activations         (stage 1 scores)
+        device const float * list_in,  // [c] stage-0 candidates  (stage 1 input)
+        device       float * list_out, // ascending selected unit ids
         uint tpitg[[thread_position_in_threadgroup]],
         uint ntg[[threads_per_threadgroup]]) {
-    const int F   = args.F;
-    const int per = (F + (int) ntg - 1) / (int) ntg;
+    const int  F   = args.F;
+    const bool st0 = (args.stage == 0);
+    // the candidate list is compact, so both stages score exactly the entries they must inspect:
+    // F for the first, c for the second
+    const int  nin = args.nin;
+    const int  per = (nin + (int) ntg - 1) / (int) ntg;
 
     float s[32];
     int   js[32];
     for (int i = 0; i < per; ++i) {
         // contiguous slices: thread t owns [t*per, (t+1)*per), so a prefix scan yields an
         // ascending unit list with no sort
-        const int j = (int) tpitg * per + i;
-        js[i] = j;
-        float v = 0.0f;
-        if (j < F) {
-            if (args.stage == 0) {
+        const int t = (int) tpitg * per + i;
+        s[i]  = 0.0f;
+        js[i] = 0;
+        if (t < nin) {
+            const int j = st0 ? t : (int) list_in[t];
+            js[i] = j;
+            if (st0) {
                 const float gv = g[j];
-                v = fabs(gv / (1.0f + exp(-gv)));
-            } else if (mask1[j] != 0) {
-                v = fabs(act[j]);
+                s[i] = fabs(gv / (1.0f + exp(-gv)));
+            } else {
+                s[i] = fabs(act[j]);
             }
         }
-        s[i] = v;
     }
 
     threadgroup int tl[64];
@@ -222,7 +227,7 @@ kernel void kernel_cascade_sel(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         const int tot = tl[0];
-        if (tot >= args.c) { lo = mid; } else { hi = mid - 1; }
+        if (tot >= args.target) { lo = mid; } else { hi = mid - 1; }
         if (tpitg == 0) { tl[1] = lo; th[1] = hi; }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         lo = tl[1]; hi = th[1];
@@ -231,17 +236,7 @@ kernel void kernel_cascade_sel(
     const float thr = as_type<float>(lo);
 
     // compaction: per-thread counts, simdgroup prefix, one small threadgroup scan, then an
-    // ascending write. Only stage 1 needs the list; stage 0 writes the mask the up stage reads.
-    if (args.stage == 0) {
-        for (int i = 0; i < per; ++i) {
-            const int j = js[i];
-            if (j < F) {
-                ((device uchar *) list)[j] = (s[i] >= thr && s[i] > 0.0f) ? 1 : 0;
-            }
-        }
-        return;
-    }
-
+    // ascending write
     int cnt = 0;
     for (int i = 0; i < per; ++i) {
         cnt += (s[i] >= thr && s[i] > 0.0f) ? 1 : 0;
@@ -266,7 +261,7 @@ kernel void kernel_cascade_sel(
     int pos = wsum[wid2] + inclusive - cnt;
     for (int i = 0; i < per; ++i) {
         if (s[i] >= thr && s[i] > 0.0f) {
-            list[pos++] = (float) js[i];
+            list_out[pos++] = (float) js[i];
         }
     }
 }
@@ -278,7 +273,7 @@ kernel void kernel_cascade_up(
         device const half  * wus,      // per-32-block scales [F, D/32], fp16 as in the source
         device const float * x,        // [D]
         device const float * g,        // [F]
-        device const uchar * mask,     // [F]
+        device const float * list,     // [c] candidate unit ids, ascending
         device       float * act,      // [F]
         uint tgpig[[threadgroup_position_in_grid]],
         uint tpitg[[thread_position_in_threadgroup]],
@@ -298,51 +293,68 @@ kernel void kernel_cascade_up(
     const int j0 = (int) tgpig * per_tg + warp * 2;
     const int j1 = j0 + 1;
 
-    const bool a0 = j0 < F && (args.prefix ? j0 < args.c : mask[j0] != 0);
-    const bool a1 = j1 < F && (args.prefix ? j1 < args.c : mask[j1] != 0);
+    // the candidates are a compact ascending list, so two per simdgroup are always live
+    const bool a0 = j0 < args.c;
+    const bool a1 = j1 < args.c;
     if (!a0 && !a1) {
         return;
     }
+    const int u0 = a0 ? (args.prefix ? j0 : (int) list[j0]) : 0;
+    const int u1 = a1 ? (args.prefix ? j1 : (int) list[j1]) : 0;
 
     float acc0 = 0.0f;
     float acc1 = 0.0f;
 
     if (a0 && a1) {
-        device const char  * wr0 = wu  + (size_t) j0*D;
-        device const char  * wr1 = wu  + (size_t) j1*D;
-        device const half  * ws0 = wus + (size_t) j0*NB;
-        device const half  * ws1 = wus + (size_t) j1*NB;
+        device const char  * wr0 = wu  + (size_t) u0*D;
+        device const char  * wr1 = wu  + (size_t) u1*D;
+        device const half  * ws0 = wus + (size_t) u0*NB;
+        device const half  * ws1 = wus + (size_t) u1*NB;
         for (int b = (int) lane; b < NB; b += 32) {
             float p0 = 0.0f, p1 = 0.0f, p2 = 0.0f, p3 = 0.0f;
             float q0 = 0.0f, q1 = 0.0f, q2 = 0.0f, q3 = 0.0f;
-            for (int t = 0; t < 32; t += 4) {
-                const float4 xv = *(device const float4 *) (x   + b*32 + t);
-                const char4  v  = *(device const char4  *) (wr0 + b*32 + t);
-                const char4  w  = *(device const char4  *) (wr1 + b*32 + t);
-                const float  pv = xv.x*(float) v.x + xv.y*(float) v.y + xv.z*(float) v.z + xv.w*(float) v.w;
-                const float  qv = xv.x*(float) w.x + xv.y*(float) w.y + xv.z*(float) w.z + xv.w*(float) w.w;
-                if      (t <  8) { p0 += pv; q0 += qv; }
-                else if (t < 16) { p1 += pv; q1 += qv; }
-                else if (t < 24) { p2 += pv; q2 += qv; }
-                else             { p3 += pv; q3 += qv; }
+            // 8-byte weight loads (uint2 = 8 int8 values) with the same 8-value chunk split
+            for (int t8 = 0; t8 < 4; ++t8) {
+                const int t = t8*8;
+                const uint2 vv = *(device const uint2 *) (wr0 + b*32 + t);
+                const uint2 ww = *(device const uint2 *) (wr1 + b*32 + t);
+                const float4 xa = *(device const float4 *) (x + b*32 + t);
+                const float4 xb = *(device const float4 *) (x + b*32 + t + 4);
+                const char4 v0 = as_type<char4>(vv.x);
+                const char4 v1 = as_type<char4>(vv.y);
+                const char4 w0 = as_type<char4>(ww.x);
+                const char4 w1 = as_type<char4>(ww.y);
+                const float pv = xa.x*(float) v0.x + xa.y*(float) v0.y + xa.z*(float) v0.z + xa.w*(float) v0.w
+                               + xb.x*(float) v1.x + xb.y*(float) v1.y + xb.z*(float) v1.z + xb.w*(float) v1.w;
+                const float qv = xa.x*(float) w0.x + xa.y*(float) w0.y + xa.z*(float) w0.z + xa.w*(float) w0.w
+                               + xb.x*(float) w1.x + xb.y*(float) w1.y + xb.z*(float) w1.z + xb.w*(float) w1.w;
+                if      (t8 == 0) { p0 += pv; q0 += qv; }
+                else if (t8 == 1) { p1 += pv; q1 += qv; }
+                else if (t8 == 2) { p2 += pv; q2 += qv; }
+                else              { p3 += pv; q3 += qv; }
             }
             acc0 += (p0 + p1 + p2 + p3) * (float) ws0[b];
             acc1 += (q0 + q1 + q2 + q3) * (float) ws1[b];
         }
     } else {
-        const int j = a0 ? j0 : j1;
+        const int j = a0 ? u0 : u1;
         device const char  * wr = wu  + (size_t) j*D;
         device const half  * ws = wus + (size_t) j*NB;
         for (int b = (int) lane; b < NB; b += 32) {
             float p0 = 0.0f, p1 = 0.0f, p2 = 0.0f, p3 = 0.0f;
-            for (int t = 0; t < 32; t += 4) {
-                const float4 xv = *(device const float4 *) (x  + b*32 + t);
-                const char4  v  = *(device const char4  *) (wr + b*32 + t);
-                const float  pv = xv.x*(float) v.x + xv.y*(float) v.y + xv.z*(float) v.z + xv.w*(float) v.w;
-                if      (t <  8) { p0 += pv; }
-                else if (t < 16) { p1 += pv; }
-                else if (t < 24) { p2 += pv; }
-                else             { p3 += pv; }
+            for (int t8 = 0; t8 < 4; ++t8) {
+                const int t = t8*8;
+                const uint2 vv = *(device const uint2 *) (wr + b*32 + t);
+                const float4 xa = *(device const float4 *) (x + b*32 + t);
+                const float4 xb = *(device const float4 *) (x + b*32 + t + 4);
+                const char4 v0 = as_type<char4>(vv.x);
+                const char4 v1 = as_type<char4>(vv.y);
+                const float pv = xa.x*(float) v0.x + xa.y*(float) v0.y + xa.z*(float) v0.z + xa.w*(float) v0.w
+                               + xb.x*(float) v1.x + xb.y*(float) v1.y + xb.z*(float) v1.z + xb.w*(float) v1.w;
+                if      (t8 == 0) { p0 += pv; }
+                else if (t8 == 1) { p1 += pv; }
+                else if (t8 == 2) { p2 += pv; }
+                else              { p3 += pv; }
             }
             acc0 += (p0 + p1 + p2 + p3) * (float) ws[b];
         }
@@ -354,12 +366,12 @@ kernel void kernel_cascade_up(
 
     if (lane == 0) {
         if (a0) {
-            const float gv = g[j0];
-            act[j0] = (gv / (1.0f + exp(-gv))) * s0;
+            const float gv = g[u0];
+            act[u0] = (gv / (1.0f + exp(-gv))) * s0;
         }
         if (a1) {
-            const float gv = g[j1];
-            act[j1] = (gv / (1.0f + exp(-gv))) * s1;
+            const float gv = g[u1];
+            act[u1] = (gv / (1.0f + exp(-gv))) * s1;
         }
     }
 }
