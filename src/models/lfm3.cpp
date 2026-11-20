@@ -95,6 +95,14 @@ std::unique_ptr<llm_graph_context> llama_model_lfm3::build_arch_graph(const llm_
     return std::make_unique<graph<false>>(params);
 }
 
+// LLAMA_CASCADE_SKIP=ffn,head,norm,add removes whole node families from the graph (timing only;
+// the output is wrong on purpose). "ABLATE=empty" only *empties the kernels*, so the difference
+// between the two isolates dispatch and graph overhead.
+static bool lfm_skip(const char * what) {
+    static const char * e = getenv("LLAMA_CASCADE_SKIP");
+    return e != nullptr && strstr(e, what) != nullptr;
+}
+
 template <bool decision>
 llama_model_lfm3::graph<decision>::graph(const llm_graph_params & params) :
     llm_build_lfm_base(params) {
@@ -169,7 +177,7 @@ llama_model_lfm3::graph<decision>::graph(const llm_graph_params & params) :
             cur = build_attn_block(cur, inp_pos, inp_hybrid->get_attn(), il);
         }
 
-        if (model.layers[il].attn_post_norm) {
+        if (model.layers[il].attn_post_norm && !lfm_skip("norm")) {
             cur = build_norm(cur, model.layers[il].attn_post_norm, NULL, LLM_NORM_RMS, il);
             cb(cur, "model.layers.{}.post_operator_norm", il);
         }
@@ -179,32 +187,42 @@ llama_model_lfm3::graph<decision>::graph(const llm_graph_params & params) :
             prev_cur = ggml_get_rows(ctx0, prev_cur, inp_out_ids);
         }
 
-        cur = ggml_add(ctx0, cur, prev_cur);
+        if (!lfm_skip("add")) {
+            cur = ggml_add(ctx0, cur, prev_cur);
+        }
 
-        auto * ffn_norm_out = build_norm(cur, model.layers[il].ffn_norm, NULL, LLM_NORM_RMS, il);
+        auto * ffn_norm_out = lfm_skip("norm") ? cur
+                             : build_norm(cur, model.layers[il].ffn_norm, NULL, LLM_NORM_RMS, il);
         cb(ffn_norm_out, "model.layers.{}.ffn_norm", il);
 
         ggml_tensor * ffn_out = build_lfm_dense_ffn(ffn_norm_out, il);
 
-        if (model.layers[il].ffn_post_norm) {
+        if (model.layers[il].ffn_post_norm && !lfm_skip("norm")) {
             ffn_out = build_norm(ffn_out, model.layers[il].ffn_post_norm, NULL, LLM_NORM_RMS, il);
             cb(ffn_out, "model.layers.{}.post_ffn_norm", il);
         }
 
-        cur = ggml_add(ctx0, ffn_out, cur);
+        cur = lfm_skip("add") ? ffn_out : ggml_add(ctx0, ffn_out, cur);
 
         cur = build_cvec(cur, il);
         cb(cur, "l_out", il);
     }
 
-    cur = build_norm(cur, model.output_norm, NULL, LLM_NORM_RMS, -1);
+    if (!lfm_skip("norm")) {
+        cur = build_norm(cur, model.output_norm, NULL, LLM_NORM_RMS, -1);
+    }
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
     {
         struct ggml_tensor * w_trim = nullptr, * idx_t = nullptr, * base_t = nullptr;
         model.get_cascade_head(&w_trim, &idx_t, &base_t);
-        if (w_trim != nullptr) {
+        if (w_trim != nullptr && lfm_skip("head")) {
+            // timing ablation: skip the head matmul, keep a cheap [n_vocab, T] tensor for sampling
+            cur = ggml_repeat(ctx0, base_t,
+                    ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, cur->ne[1], model.vocab.n_tokens()));
+            cb(cur, "result_output", -1);
+        } else if (w_trim != nullptr) {
             // vocabulary cut: the head runs on the kept ids only, then scatters into the full
             // logits so sampling and detokenization are untouched
             struct ggml_tensor * lt = ggml_mul_mat(ctx0, w_trim, cur);          // [V', T]

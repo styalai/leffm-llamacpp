@@ -95,7 +95,17 @@ ggml_tensor * llm_build_lfm_base::build_lfm_shortconv(ggml_tensor * cur,
 // Cascade FFN (opt-in): LLAMA_CASCADE="c,k" replaces the dense FFN on single-token steps.
 // gate matmul stays stock; the two custom ops do exact top-k selection and the gathered projections.
 ggml_tensor * llm_build_lfm_base::build_lfm_cascade_ffn(ggml_tensor * cur, int il, int c, int k) {
-    struct ggml_tensor * g = build_lora_mm(model.layers[il].ffn_gate, cur);
+    struct ggml_tensor * g;
+    {
+        const char * e = getenv("LLAMA_CASCADE_SKIP");
+        if (e != nullptr && strstr(e, "gate") != nullptr) {
+            // timing ablation: skip the gate GEMV (the score is then garbage)
+            g = ggml_repeat(ctx0, ggml_view_1d(ctx0, cur, 1, 0),
+                    ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, model.layers[il].ffn_gate->ne[1], cur->ne[1]));
+        } else {
+            g = build_lora_mm(model.layers[il].ffn_gate, cur);
+        }
+    }
     cb(g, "model.layers.{}.ffn_gate", il);
 
     struct ggml_tensor * wu  = model.get_cascade_up_w(il);
@@ -135,6 +145,12 @@ static bool lfm_cascade_cfg(int & c, int & k) {
 
 ggml_tensor * llm_build_lfm_base::build_lfm_dense_ffn(ggml_tensor * cur,
                                                       int il) {
+    {   // timing ablation: remove the whole FFN from the graph (wrong output, speed only)
+        const char * e = getenv("LLAMA_CASCADE_SKIP");
+        if (e != nullptr && strstr(e, "ffn") != nullptr) {
+            return cur;
+        }
+    }
     int cascade_c = 0, cascade_k = 0;
     if (cur->ne[1] == 1 && cur->ne[2] == 1 && cur->ne[3] == 1 && lfm_cascade_cfg(cascade_c, cascade_k)) {
         return build_lfm_cascade_ffn(cur, il, cascade_c, cascade_k);

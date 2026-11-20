@@ -4539,7 +4539,7 @@ int ggml_metal_op_cascade_up(ggml_metal_op_t ctx, int idx) {
     ggml_metal_buffer_id bid_mf   = { bid_sel.metal, bid_sel.offs + 2*sel->nb[1] };
 
     const int ntg_sel = 512;
-    const int ntg_up  = 128;   // 4 simdgroups x 2 units per simdgroup = 8 units per threadgroup
+    const int ntg_up  = 512;   // 4 simdgroups x 2 units per simdgroup = 8 units per threadgroup
 
     // selection, stage 0: scores from g -> mask1
     {
@@ -4551,6 +4551,11 @@ int ggml_metal_op_cascade_up(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_buffer  (enc, bid_m1,  3);
         ggml_metal_encoder_set_buffer  (enc, bid_m1,  4);
         ggml_metal_encoder_dispatch_threadgroups(enc, 1, 1, 1, ntg_sel, 1, 1);
+        // LLAMA_CASCADE_EXTRA_DISP: repeat this (idempotent) dispatch to measure the cost of one
+        static const int extra = getenv("LLAMA_CASCADE_EXTRA_DISP") ? atoi(getenv("LLAMA_CASCADE_EXTRA_DISP")) : 0;
+        for (int r = 0; r < extra; ++r) {
+            ggml_metal_encoder_dispatch_threadgroups(enc, 1, 1, 1, ntg_sel, 1, 1);
+        }
     }
     ggml_metal_encoder_memory_barrier(enc);
 
@@ -4572,6 +4577,12 @@ int ggml_metal_op_cascade_up(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_dispatch_threadgroups(enc, (int) ((F + per_tg - 1)/per_tg), 1, 1, ntg_up, 1, 1);
     }
     ggml_metal_encoder_memory_barrier(enc);
+    {   // LLAMA_CASCADE_EXTRA_BAR: insert N-1 extra barriers to price one barrier
+        static const int extra = getenv("LLAMA_CASCADE_EXTRA_BAR") ? atoi(getenv("LLAMA_CASCADE_EXTRA_BAR")) : 1;
+        for (int r = 1; r < extra; ++r) {
+            ggml_metal_encoder_memory_barrier(enc);
+        }
+    }
 
     // selection, stage 1: |act| among the candidates -> final mask
     {
