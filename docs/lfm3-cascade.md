@@ -1,5 +1,8 @@
 # LFM3 cascade FFN and vocabulary cut (this fork)
 
+The variant this fork runs is called **leffm** — Liquid Efficient Foundation Model: LFM3-1.7B with the
+cascade FFN and a cut vocabulary.
+
 This is a research fork of [llama.cpp](https://github.com/ggml-org/llama.cpp), branched at `7fce543`.
 It adds one thing: an LFM3 (`lfm3`) FFN that computes fewer units per token, plus a matching cut of the
 tied input embedding and output head. Everything else is upstream llama.cpp, unmodified.

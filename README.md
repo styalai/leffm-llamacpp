@@ -1,7 +1,10 @@
 # leffm-llamacpp
 
+**leffm** — Liquid Efficient Foundation Model — is LFM3-1.7B with a sparse two-stage FFN cascade and a
+cut vocabulary.
+
 A research fork of [llama.cpp](https://github.com/ggml-org/llama.cpp), branched at `7fce543`, that runs
-LFM3-1.7B with a sparse two-stage FFN cascade and a cut vocabulary. Everything else is upstream
+it. Everything else is upstream
 llama.cpp, unmodified, and nothing here is proposed for upstream. The goal was to measure what a
 -30% FLOPs model actually buys in wall clock, not just on paper.
 
