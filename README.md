@@ -65,8 +65,8 @@ cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=native \
       -DLLAMA_CURL=OFF -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j --target llama-cli llama-bench
 
-# Apple silicon or CPU
-cmake -B build -DGGML_METAL=ON -DLLAMA_CURL=OFF -DCMAKE_BUILD_TYPE=Release
+# Apple silicon (Metal is the default there) or CPU
+cmake -B build -DLLAMA_CURL=OFF -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j --target llama-cli llama-bench
 
 hf download LiquidAI/LFM3-1.7B-GGUF LFM3-1.7B-Q8_0.gguf --local-dir .
