@@ -20,6 +20,7 @@
 #define CASCADE_UP_WARPS   4
 #define CASCADE_DOWN_SLICES 32
 #define CASCADE_DOWN_BLOCK  512   // threads per block: 512*4 outputs covers D in one step
+#define CASCADE_DOWN_SEL_BLOCK 512   // block size of the selection fused into CASCADE_DOWN
 
 // exact top-`target` of a non-negative score array, compacted into an ascending list of unit ids.
 // thread t owns the contiguous slice [t*per, (t+1)*per) so a scan of per-thread counts yields an
@@ -592,12 +593,12 @@ void ggml_cuda_op_cascade_up(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
     g_ct.start(st);
     if (!cascade_skip("sel0"))
     cascade_sel_kernel<true><<<1, CASCADE_SEL_BLOCK, shmem, st>>>(
-        (const float *) g->data, act, lsk, lst, F, c, F, c, sel_npass());
+        (const float *) g->data, act, lst, lst, F, c, F, c, sel_npass());
     {   // CASCADE_CUDA_EXTRA_DISP: repeat this idempotent dispatch to price one dispatch
         static const int extra = getenv("CASCADE_CUDA_EXTRA_DISP") ? atoi(getenv("CASCADE_CUDA_EXTRA_DISP")) : 0;
         for (int r = 0; r < extra; ++r) {
             cascade_sel_kernel<true><<<1, CASCADE_SEL_BLOCK, shmem, st>>>(
-                (const float *) g->data, act, lsk, lst, F, c, F, c, sel_npass());
+                (const float *) g->data, act, lst, lst, F, c, F, c, sel_npass());
         }
     }
     g_ct.stop(st, g_ct.sel0, g_ct.n_sel0);
