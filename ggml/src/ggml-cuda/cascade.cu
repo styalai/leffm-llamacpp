@@ -431,7 +431,10 @@ void ggml_cuda_op_cascade_up(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
     float * lsk = sel + 2*F;                  // row 2 (stage-1 list)
 
     cudaStream_t st = ctx.stream();
-    const int shmem = (int) (F*sizeof(float));
+    // the scores live in a strided layout (s[i*nt + tid]) and address the full nt*per slots, which is
+    // at least nin, so the buffer is sized by slots and not by nin
+    const int per0  = (F + CASCADE_SEL_BLOCK - 1)/CASCADE_SEL_BLOCK;
+    const int shmem = (int) (per0*CASCADE_SEL_BLOCK*sizeof(float));
 
     g_ct.start(st);
     if (!cascade_skip("sel0"))
@@ -450,7 +453,8 @@ void ggml_cuda_op_cascade_up(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
 
     g_ct.start(st);
     if (!cascade_skip("sel1"))
-    cascade_sel_kernel<false><<<1, CASCADE_SEL_BLOCK, (int) (c*sizeof(float)), st>>>(
+    const int per1  = (c + CASCADE_SEL_BLOCK - 1)/CASCADE_SEL_BLOCK;
+    cascade_sel_kernel<false><<<1, CASCADE_SEL_BLOCK, (int) (per1*CASCADE_SEL_BLOCK*sizeof(float)), st>>>(
         (const float *) g->data, act, lst, lsk, F, c, c, k, sel_npass());
     g_ct.stop(st, g_ct.sel1, g_ct.n_sel1);
     CUDA_CHECK(cudaGetLastError());
