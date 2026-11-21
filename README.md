@@ -112,7 +112,7 @@ disables the repack itself. Omit `LLAMA_CASCADE` (or set `0,0`) for the stock de
 
 A gated FFN computes
 
-$$\text{FFN}(x) = \left(\text{silu}\left(x W_{\text{gate}}^{T}\right) \odot \left(x W_{\text{up}}^{T}\right)\right) W_{\text{down}}$$.
+$$\mathrm{FFN}(x) = \big(\mathrm{silu}(xW_{\mathrm{gate}}^{T}) \odot (xW_{\mathrm{up}}^{T})\big) W_{\mathrm{down}}$$.
 
 The gate must see every unit — it is the router — but the two projections do not:
 
