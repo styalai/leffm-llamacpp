@@ -31,6 +31,12 @@ class LFM3Model(TextModel):
         if name.startswith(cls._media_prefixes):
             return None
 
+        # the stage-1 filter constant of the cascade checkpoints: a calibration buffer, not a weight
+        # of the model. Without it stage 1 ranks by |silu(g)| alone, measured 0.020 nats at zero-shot
+        # (analysis/lfm3_const.md), and the fork's graph implements exactly that.
+        if name.endswith(".feed_forward.const"):
+            return None
+
         name = name.removeprefix("lfm.")
 
         return super().filter_tensors((name, gen))
@@ -79,6 +85,12 @@ class LFM3Model(TextModel):
         if templates:
             self.gguf_writer.add_chat_template(templates)
 
+    def get_vocab_base_pre(self, tokenizer) -> str:
+        # a vocabulary cut renumbers the ids, so the probe-string hash the stock check uses to identify
+        # the pre-tokenizer no longer matches even though the pre-tokenizer is unchanged. Every LFM3
+        # checkpoint uses the LFM2 family one.
+        return "lfm2"
+
     def set_gguf_parameters(self):
         layer_types = self.hparams["layer_types"]
         n_kv_heads = self.hparams["num_key_value_heads"]
@@ -112,6 +124,13 @@ class LFM3Model(TextModel):
         yield (self.format_tensor_name(gguf.MODEL_TENSOR.ROPE_FREQS), rope_freqs)
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        # cascade checkpoints replace the FFN module with a CascadeMLP, so the three matmuls are stored
+        # as raw parameters named `.gate` / `.up` / `.down` instead of the stock `.gate_proj.weight` etc.
+        for short, proj in (("feed_forward.gate", "feed_forward.gate_proj"),
+                            ("feed_forward.up",   "feed_forward.up_proj"),
+                            ("feed_forward.down", "feed_forward.down_proj")):
+            if name.endswith(short):
+                name = name[:-len(short)] + proj + ".weight"
         # conv op requires 2d tensor
         if "conv.conv" in name:
             data_torch = data_torch.squeeze(1)
