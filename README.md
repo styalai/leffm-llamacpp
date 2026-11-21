@@ -1,5 +1,11 @@
 # llama.cpp
 
+> **This is a research fork.** It adds a sparse FFN and a vocabulary cut for LFM3 models: at
+> `c = 5,120`, `k = 2,304` of 7,680 units the FFN costs 65.6% of dense, the trimmed head 52.4%, and
+> batch-1 decode measures 1.19x on an L4 and 1.22x on an M5 with the vocabulary cut. It is not
+> proposed for upstream. **What the fork adds, how to build and run it, and the measured trade-offs:
+> [docs/lfm3-cascade.md](docs/lfm3-cascade.md).**
+
 ![llama.cpp](https://raw.githubusercontent.com/ggml-org/llama-brand/refs/heads/master/logo/svg/cover/llama-cpp/cover-llama-cpp-dark.svg)
 
 <div align="center">
