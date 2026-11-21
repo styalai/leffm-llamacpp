@@ -5318,6 +5318,74 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     return 0;
 }
 
+// GGML_CUDA_TIME_NODES=1 times every node of the first two directly executed graphs and prints the
+// totals per op. It stays off the capture path (a blocking event synchronise cannot be captured) and
+// switches itself off after those two graphs. 60% of a token is outside the cascade kernels, and this
+// is the only way to see what is in it.
+static bool ggml_cuda_node_prof_active = false;
+static bool ggml_cuda_node_prof_init   = false;
+static bool ggml_cuda_node_prof_on() {
+    if (!ggml_cuda_node_prof_init) {
+        ggml_cuda_node_prof_init   = true;
+        const char * e = getenv("GGML_CUDA_TIME_NODES");
+        ggml_cuda_node_prof_active = e != nullptr && e[0] == '1';
+    }
+    return ggml_cuda_node_prof_active;
+}
+
+struct ggml_cuda_node_prof_t {
+    cudaEvent_t e0 = nullptr;
+    cudaEvent_t e1 = nullptr;
+    double      ms[GGML_OP_COUNT] = {};
+    long        n [GGML_OP_COUNT] = {};
+    int         graphs = 0;
+    long        nodes  = 0;
+};
+static ggml_cuda_node_prof_t g_node_prof;
+
+static void ggml_cuda_node_prof_begin(ggml_backend_cuda_context * ctx) {
+    if (g_node_prof.e0 == nullptr) {
+        CUDA_CHECK(cudaEventCreate(&g_node_prof.e0));
+        CUDA_CHECK(cudaEventCreate(&g_node_prof.e1));
+    }
+    CUDA_CHECK(cudaEventRecord(g_node_prof.e0, ctx->stream()));
+}
+
+static void ggml_cuda_node_prof_end(ggml_backend_cuda_context * ctx, const ggml_tensor * node) {
+    CUDA_CHECK(cudaEventRecord(g_node_prof.e1, ctx->stream()));
+    CUDA_CHECK(cudaEventSynchronize(g_node_prof.e1));
+    float ms = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&ms, g_node_prof.e0, g_node_prof.e1));
+    g_node_prof.ms[node->op] += ms;
+    g_node_prof.n [node->op] += 1;
+    g_node_prof.nodes       += 1;
+}
+
+static void ggml_cuda_node_prof_graph_done() {
+    if (!ggml_cuda_node_prof_active) {
+        return;
+    }
+    if (++g_node_prof.graphs < 2) {
+        return;
+    }
+    bool done[GGML_OP_COUNT] = {};
+    for (int r = 0; r < 24; ++r) {
+        int best = -1;
+        for (int op = 0; op < GGML_OP_COUNT; ++op) {
+            if (!done[op] && g_node_prof.ms[op] > 0.0 && (best < 0 || g_node_prof.ms[op] > g_node_prof.ms[best])) {
+                best = op;
+            }
+        }
+        if (best < 0) {
+            break;
+        }
+        done[best] = true;
+        fprintf(stderr, "GGML_CUDA_TIME_NODES %-22s %8.3f ms  %5ld nodes\n",
+                ggml_op_name((enum ggml_op) best), g_node_prof.ms[best], g_node_prof.n[best]);
+    }
+    ggml_cuda_node_prof_active = false;
+}
+
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
 
@@ -5503,7 +5571,14 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 GGML_UNUSED(integrated);
 #endif  // NDEBUG
 
+                const bool nprof = ggml_cuda_node_prof_on() && !use_cuda_graph;
+                if (nprof) {
+                    ggml_cuda_node_prof_begin(cuda_ctx);
+                }
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
+                if (nprof) {
+                    ggml_cuda_node_prof_end(cuda_ctx, node);
+                }
                 if (!ok) {
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
@@ -5512,6 +5587,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);
                }
+            }
+
+            if (!use_cuda_graph) {
+                ggml_cuda_node_prof_graph_done();
             }
         }
 

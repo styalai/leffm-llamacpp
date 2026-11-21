@@ -15,10 +15,9 @@
 
 #define CASCADE_SEL_BLOCK 1024
 #define CASCADE_SEL_MAX   8192   // scores held in shared memory (32 KB)
-#define CASCADE_SEL_GROUPS 8     // private histograms: one per 128 threads
 #define CASCADE_UP_BLOCK  128   // four warps, one candidate each
 #define CASCADE_UP_WARPS   4
-#define CASCADE_DOWN_SLICES 64
+#define CASCADE_DOWN_SLICES 32
 
 // exact top-`target` of a non-negative score array, compacted into an ascending list of unit ids.
 // thread t owns the contiguous slice [t*per, (t+1)*per) so a scan of per-thread counts yields an
@@ -39,19 +38,15 @@ __global__ void cascade_sel_kernel(
         const int F,
         const int c,
         const int nin,
-        const int target) {
+        const int target,
+        const int npass) {
     extern __shared__ float s[];              // nin scores
-    // One histogram per group of 128 threads. The scores take very few distinct top bytes (a dozen),
-    // so a single shared histogram serialised thousands of atomics onto the same addresses; that,
-    // not the passes or the barriers, was the whole cost of a selection on the L4.
-    __shared__ int hist[CASCADE_SEL_GROUPS][256];
-    __shared__ int histm[256];
+    __shared__ int hist[256];
     __shared__ int scan[CASCADE_SEL_BLOCK];
     __shared__ int sel_digit, sel_need;
     const int tid = threadIdx.x;
     const int nt  = blockDim.x;
     const int per = (nin + nt - 1) / nt;
-    const int grp = (tid*CASCADE_SEL_GROUPS) / CASCADE_SEL_BLOCK;
 
     // the block covers nt*per >= nin slots and only [0, nin) exists in shared memory: the padding
     // must not be written (every later read is guarded by t < nin)
@@ -73,8 +68,11 @@ __global__ void cascade_sel_kernel(
     unsigned prefix = 0u;
     int need = target;
     for (int sh = 24; sh >= 0; sh -= 8) {
-        for (int i = tid; i < CASCADE_SEL_GROUPS*256; i += nt) {
-            hist[i >> 8][i & 0xFF] = 0;
+        if ((24 - sh)/8 >= npass) {
+            break;      // timing only: fewer passes leave the threshold unresolved
+        }
+        for (int b = tid; b < 256; b += nt) {
+            hist[b] = 0;
         }
         __syncthreads();
         const unsigned above = (sh == 24) ? 0u : (0xFFFFFFFFu << (sh + 8));
@@ -84,18 +82,9 @@ __global__ void cascade_sel_kernel(
             if (t < nin) {
                 const unsigned bits = __float_as_uint(s[t]);
                 if ((bits & above) == want) {
-                    atomicAdd(&hist[grp][(bits >> sh) & 0xFF], 1);
+                    atomicAdd(&hist[(bits >> sh) & 0xFF], 1);
                 }
             }
-        }
-        __syncthreads();
-        for (int b = tid; b < 256; b += nt) {
-            int v = 0;
-            #pragma unroll
-            for (int g = 0; g < CASCADE_SEL_GROUPS; ++g) {
-                v += hist[g][b];
-            }
-            histm[b] = v;
         }
         __syncthreads();
         // pick the digit: the smallest d whose bucket holds the rank we still seek, i.e. the
@@ -103,8 +92,8 @@ __global__ void cascade_sel_kernel(
         // shuffles: a block-wide scan of 256 bins cost 17 barriers per pass.
         if (tid < 32) {
             const int lo = 8*tid;
-            const int t0 = histm[lo + 0], t1 = histm[lo + 1], t2 = histm[lo + 2], t3 = histm[lo + 3];
-            const int t4 = histm[lo + 4], t5 = histm[lo + 5], t6 = histm[lo + 6], t7 = histm[lo + 7];
+            const int t0 = hist[lo + 0], t1 = hist[lo + 1], t2 = hist[lo + 2], t3 = hist[lo + 3];
+            const int t4 = hist[lo + 4], t5 = hist[lo + 5], t6 = hist[lo + 6], t7 = hist[lo + 7];
             const int tot = t0 + t1 + t2 + t3 + t4 + t5 + t6 + t7;
             int above = tot;                       // inclusive suffix over the lanes
             for (int off = 1; off < 32; off <<= 1) {
@@ -139,6 +128,9 @@ __global__ void cascade_sel_kernel(
         __syncthreads();
     }
     const unsigned thr = prefix;
+    if (npass < 4) {
+        return;         // timing only: skip the compaction, the output list stays stale
+    }
 
     // compaction: ascending ids of the qualifying entries, capped at `target` so the list is exactly
     // the size the gathered kernels index
@@ -405,6 +397,21 @@ static bool cascade_skip(const char * what) {
     return e != nullptr && strstr(e, what) != nullptr;
 }
 
+static int sel_npass() {
+    static int v = -1;
+    if (v < 0) {
+        v = 4;
+        const char * e = getenv("CASCADE_CUDA_SELPHASE");
+        if (e != nullptr) {
+            const int t = atoi(e);
+            if (t >= 0 && t < 4) {
+                v = t;
+            }
+        }
+    }
+    return v;
+}
+
 void ggml_cuda_op_cascade_up(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * g   = dst->src[0];
     const ggml_tensor * x   = dst->src[1];
@@ -429,7 +436,7 @@ void ggml_cuda_op_cascade_up(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
     g_ct.start(st);
     if (!cascade_skip("sel0"))
     cascade_sel_kernel<true><<<1, CASCADE_SEL_BLOCK, shmem, st>>>(
-        (const float *) g->data, act, lsk, lst, F, c, F, c);
+        (const float *) g->data, act, lsk, lst, F, c, F, c, sel_npass());
     g_ct.stop(st, g_ct.sel0, g_ct.n_sel0);
     CUDA_CHECK(cudaGetLastError());
 
@@ -444,7 +451,7 @@ void ggml_cuda_op_cascade_up(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
     g_ct.start(st);
     if (!cascade_skip("sel1"))
     cascade_sel_kernel<false><<<1, CASCADE_SEL_BLOCK, (int) (c*sizeof(float)), st>>>(
-        (const float *) g->data, act, lst, lsk, F, c, c, k);
+        (const float *) g->data, act, lst, lsk, F, c, c, k, sel_npass());
     g_ct.stop(st, g_ct.sel1, g_ct.n_sel1);
     CUDA_CHECK(cudaGetLastError());
 }
