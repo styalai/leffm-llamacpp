@@ -67,6 +67,10 @@ cmake --build build -j --target llama-cli llama-bench
 hf download LiquidAI/LFM3-1.7B-GGUF LFM3-1.7B-Q8_0.gguf --local-dir .
 ```
 
+`-DCMAKE_CUDA_ARCHITECTURES=89` is Ada (L4, L40S, RTX 40xx); use `80` for A100, `86` for A10 /
+RTX 30xx, `90` for H100, or `native`. `-DGGML_CUDA_FA=OFF` skips the FlashAttention kernels, which
+batch-1 decode does not use, and keeps the build short.
+
 A converted cascade checkpoint carries its operating point in the GGUF (`lfm3.cascade.c` /
 `lfm3.cascade.k`), so the cascade needs no flags, no vocabulary file and no `--no-repack` — the repack
 is disabled by the file itself:
