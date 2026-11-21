@@ -37,18 +37,6 @@ No benchmark suite beyond perplexity was run, so treat these as the price on tha
 general statement. At `LLAMA_CASCADE=7680,7680` the cascade reproduces dense greedy output exactly,
 which is the check that everything below the selection is arithmetically the dense path.
 
-### Hardware tested, and nothing else
-
-| backend | hardware |
-| --- | --- |
-| CUDA | NVIDIA L4, 23 GB, compute capability 8.9, CUDA 13.0, one Colab VM |
-| Metal | Apple M5, 8 GPU cores, 147.5 GB/s measured streaming peak |
-| CPU | the same M5's int8 kernels, `-t 4` |
-
-Not tested: any other NVIDIA part (no A100/H100), any other Apple silicon, batch sizes above one. All
-CUDA benchmarks ran with FlashAttention off, which changes nothing at 32-token contexts but means the
-absolute numbers are not the default-config ones.
-
 ## Usage
 
 Copy-paste; on macOS drop the `GGML_CUDA` flags and it builds Metal instead.
