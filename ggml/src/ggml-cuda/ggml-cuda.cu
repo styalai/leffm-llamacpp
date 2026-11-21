@@ -5334,36 +5334,49 @@ static bool ggml_cuda_node_prof_on() {
 }
 
 struct ggml_cuda_node_prof_t {
-    cudaEvent_t e0 = nullptr;
-    cudaEvent_t e1 = nullptr;
-    double      ms[GGML_OP_COUNT] = {};
-    long        n [GGML_OP_COUNT] = {};
-    int         graphs = 0;
-    long        nodes  = 0;
+    std::vector<cudaEvent_t> e0;
+    std::vector<cudaEvent_t> e1;
+    std::vector<int>         ops;
+    double ms[GGML_OP_COUNT] = {};
+    long   n [GGML_OP_COUNT] = {};
+    int    graphs = 0;
 };
 static ggml_cuda_node_prof_t g_node_prof;
 
-static void ggml_cuda_node_prof_begin(ggml_backend_cuda_context * ctx) {
-    if (g_node_prof.e0 == nullptr) {
-        CUDA_CHECK(cudaEventCreate(&g_node_prof.e0));
-        CUDA_CHECK(cudaEventCreate(&g_node_prof.e1));
+// Recording two events around every node costs about a microsecond each, but synchronising per node
+// would drain the pipeline and inflate each node by the launch latency, which is what made the first
+// profile useless. Record while running, read once the graph is done.
+static void ggml_cuda_node_prof_begin(ggml_backend_cuda_context * ctx, int i, int op) {
+    if ((size_t) i >= g_node_prof.e0.size()) {
+        const size_t n = (size_t) i + 64;
+        g_node_prof.e0.resize(n, nullptr);
+        g_node_prof.e1.resize(n, nullptr);
+        g_node_prof.ops.resize(n, GGML_OP_NONE);
     }
-    CUDA_CHECK(cudaEventRecord(g_node_prof.e0, ctx->stream()));
+    if (g_node_prof.e0[i] == nullptr) {
+        CUDA_CHECK(cudaEventCreate(&g_node_prof.e0[i]));
+        CUDA_CHECK(cudaEventCreate(&g_node_prof.e1[i]));
+    }
+    g_node_prof.ops[i] = op;
+    CUDA_CHECK(cudaEventRecord(g_node_prof.e0[i], ctx->stream()));
 }
 
-static void ggml_cuda_node_prof_end(ggml_backend_cuda_context * ctx, const ggml_tensor * node) {
-    CUDA_CHECK(cudaEventRecord(g_node_prof.e1, ctx->stream()));
-    CUDA_CHECK(cudaEventSynchronize(g_node_prof.e1));
-    float ms = 0.0f;
-    CUDA_CHECK(cudaEventElapsedTime(&ms, g_node_prof.e0, g_node_prof.e1));
-    g_node_prof.ms[node->op] += ms;
-    g_node_prof.n [node->op] += 1;
-    g_node_prof.nodes       += 1;
+static void ggml_cuda_node_prof_end(ggml_backend_cuda_context * ctx, int i) {
+    CUDA_CHECK(cudaEventRecord(g_node_prof.e1[i], ctx->stream()));
 }
 
-static void ggml_cuda_node_prof_graph_done() {
+static void ggml_cuda_node_prof_graph_done(ggml_backend_cuda_context * ctx, int n_timed) {
     if (!ggml_cuda_node_prof_active) {
         return;
+    }
+    CUDA_CHECK(cudaStreamSynchronize(ctx->stream()));
+    for (int i = 0; i < n_timed; ++i) {
+        float ms = 0.0f;
+        if (cudaEventElapsedTime(&ms, g_node_prof.e0[i], g_node_prof.e1[i]) != cudaSuccess) {
+            continue;
+        }
+        g_node_prof.ms[g_node_prof.ops[i]] += ms;
+        g_node_prof.n [g_node_prof.ops[i]] += 1;
     }
     if (++g_node_prof.graphs < 2) {
         return;
@@ -5428,6 +5441,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         // With the use of CUDA graphs, the execution will be performed by the graph launch.
         if (!use_cuda_graph || cuda_graph_update_required) {
             [[maybe_unused]] int prev_i = 0;
+            int                 n_timed = 0;
 
             if (stream_ctx.concurrent_events.size() > 0) {
                 should_launch_concurrent_events = true;
@@ -5573,11 +5587,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                 const bool nprof = ggml_cuda_node_prof_on() && !use_cuda_graph;
                 if (nprof) {
-                    ggml_cuda_node_prof_begin(cuda_ctx);
+                    ggml_cuda_node_prof_begin(cuda_ctx, n_timed, node->op);
                 }
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
                 if (nprof) {
-                    ggml_cuda_node_prof_end(cuda_ctx, node);
+                    ggml_cuda_node_prof_end(cuda_ctx, n_timed);
+                    n_timed += 1;
                 }
                 if (!ok) {
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
@@ -5590,7 +5605,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             }
 
             if (!use_cuda_graph) {
-                ggml_cuda_node_prof_graph_done();
+                ggml_cuda_node_prof_graph_done(cuda_ctx, n_timed);
             }
         }
 

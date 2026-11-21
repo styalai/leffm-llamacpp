@@ -55,7 +55,9 @@ __global__ void cascade_sel_kernel(
         if (t < nin) {
             if (STAGE0) {
                 const float gv = g[t];
-                s[t] = fabsf(gv / (1.0f + expf(-gv)));
+                // __expf: the score only ranks candidates, and the accurate expf costs ~25 us per
+                // layer here, which was the largest single item of a selection
+                s[t] = fabsf(gv / (1.0f + __expf(-gv)));
             } else {
                 s[t] = fabsf(act[min(max((int) list_in[t], 0), F - 1)]);
             }
