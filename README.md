@@ -56,20 +56,25 @@ that everything below the selection is arithmetically the dense path.
 
 ## Usage
 
-Copy-paste; on macOS drop the `GGML_CUDA` flags and it builds Metal instead.
+Copy-paste, CUDA first, Metal second.
 
 ```sh
+# NVIDIA GPU: FlashAttention is built in, and `native` compiles for the local GPU
 git clone https://github.com/styalai/leffm-llamacpp && cd leffm-llamacpp
-cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=89 -DGGML_CUDA_FA=OFF \
+cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=native \
       -DLLAMA_CURL=OFF -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j --target llama-cli llama-bench
+
+# Apple silicon or CPU
+cmake -B build -DGGML_METAL=ON -DLLAMA_CURL=OFF -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j --target llama-cli llama-bench
 
 hf download LiquidAI/LFM3-1.7B-GGUF LFM3-1.7B-Q8_0.gguf --local-dir .
 ```
 
-`-DCMAKE_CUDA_ARCHITECTURES=89` is Ada (L4, L40S, RTX 40xx); use `80` for A100, `86` for A10 /
-RTX 30xx, `90` for H100, or `native`. `-DGGML_CUDA_FA=OFF` skips the FlashAttention kernels, which
-batch-1 decode does not use, and keeps the build short.
+`-DCMAKE_CUDA_ARCHITECTURES=native` targets the GPU in the machine; set it explicitly only to
+cross-compile (`89` Ada — L4, L40S, RTX 40xx; `80` A100; `86` A10 / RTX 30xx; `90` H100). The CUDA
+numbers above were measured with `-DGGML_CUDA_FA=OFF`, which changes the attention kernels only.
 
 A converted cascade checkpoint carries its operating point in the GGUF (`lfm3.cascade.c` /
 `lfm3.cascade.k`), so the cascade needs no flags, no vocabulary file and no `--no-repack` — the repack
