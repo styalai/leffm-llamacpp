@@ -41,12 +41,17 @@ three.
 | --- | --- | --- | --- | --- | --- |
 | CUDA | L4, 23 GB, sm_89, CUDA 13.0 | 110.9 t/s (9.01 ms) | 123.7 (8.09) | **132.7 (7.54)** | **1.19x** |
 | Metal | Apple M5, 8 GPU cores, 147.5 GB/s measured | 66.0 t/s (15.16 ms) | 75.1 (13.32) | **80.2 (12.47)** | **1.22x** |
-| CPU | x86/ARM, ggml int8 SIMD, `-t 4` | 43.3 t/s (23.1 ms) | 37.8 (26.5) | 39.9 (25.1) | **0.87x, loses** |
+| CPU | x86/ARM, ggml int8 SIMD, `-t 4` | 43.3 t/s (23.1 ms) | 42.1 (23.8) | **44.4 (22.5)** | **1.00x** |
 
-The CPU row is the honest counterexample: ggml's dense int8 matvec already streams bytes at close to
-what the part can do, so reading fewer of them buys nothing and the selection is pure overhead. The
-GPU rows win for the opposite reason — their gathers reach 160-210 GB/s against a ~300 GB/s array, so
-halving the bytes does help, just not proportionally.
+The CPU row took real work to reach level: the naive port measured 0.87x (dense 43.3 vs cut 39.9),
+because ggml's dense int8 matvec already streams bytes at close to what the part can do, so reading
+fewer of them buys nothing and the selection is pure overhead. Reusing the score pass's silu instead
+of a second expf per selected row and replacing both nth_element selections with the same radix select
+the other backends use brought it to 1.00-1.05x across paired interleaved runs (cut 45.3/44.4 vs
+dense 43.2/44.3). A unit-major down layout measured worse (0.847 paired) and was reverted: the
+chunk-major layout it replaced is four near-sequential 128-byte streams per thread, not the scattered
+lines it was first misread as. The GPU rows win for the opposite reason — their gathers reach
+160-210 GB/s against a ~300 GB/s array, so halving the bytes does help, just not proportionally.
 
 ### Where the time goes (CUDA, per token, 24 layers)
 
@@ -94,7 +99,9 @@ general claim.
 - **Dispatch cost**: 11.5 us per launch, measured by repeating an idempotent selection.
 - **Metal**: bisection vs radix select; down threadgroup of 128 vs 512 threads; two units per
   simdgroup with `uint2` loads; the unit-major int8 repack; 16 threadgroups; ablation masks.
-- **CPU**: exact selection, SIMD gathered dot, the transposed repack, thread sweeps from 1 to 8.
+- **CPU**: exact selection (nth_element, then the radix select shared with CUDA and Metal), SIMD
+  gathered dot, silu reuse from the score pass, both down layouts (chunk-major kept, unit-major
+  reverted on a paired regression), thread sweeps from 1 to 8.
 
 ## What has not been tested
 
