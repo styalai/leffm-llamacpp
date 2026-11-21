@@ -138,16 +138,6 @@ carry 0.41% of the stock model's probability mass on held-out text and the rebui
 
 The cascade applies to single-token steps only (`T = 1`); prompt processing takes the dense path.
 
-## Tested / not tested
-
-- **Tested**: greedy-identity at `c = k = F` on CUDA, Metal and CPU; the radix selection cross-checked
-  against `nth_element` (randomized trials, plus real activations through `LLAMA_CASCADE_VERIFY_SEL`,
-  which the CPU bench runner runs at `c=5120, k=2304` before it times anything); every kernel variant listed in
-  [docs/lfm3-cascade.md](docs/lfm3-cascade.md) (radix vs bisection, load widths, occupancy shapes,
-  slice counts, and a fused selection+gather+reduction that measured slower and was reverted);
-  per-dispatch cost, measured by repeating an idempotent selection.
-- **Not tested**: quality beyond perplexity on one corpus, downstream benchmarks, second seeds.
-
 ## Licence
 
 The llama.cpp part is MIT, as upstream. Model weights produced with this fork are derivatives of
