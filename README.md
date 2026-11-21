@@ -8,11 +8,16 @@
 LFM3-1.7B Q8_0, batch-1 decode, `llama-bench -p 0 -n 32 -r 3`, best of five. "basic" is stock dense
 llama.cpp, "leffm" is this fork with the cascade and the vocabulary cut.
 
-| backend | hardware | basic | leffm | speedup |
-| --- | --- | --- | --- | --- |
-| CUDA | L4 23 GB, sm_89 | 9.01 ms/token | **7.54 ms/token** | **1.19x** |
-| Metal | Apple M5, 8 GPU cores | 15.16 ms/token | **12.47 ms/token** | **1.22x** |
-| CPU | x86/ARM int8, `-t 4` | 23.1 ms/token | 25.1 ms/token | 0.87x |
+| backend | basic | leffm | speedup |
+| --- | --- | --- | --- |
+| CUDA | 9.01 ms/token | **7.54 ms/token** | **1.19x** |
+| Metal | 15.16 ms/token | **12.47 ms/token** | **1.22x** |
+| CPU | 23.1 ms/token | 25.1 ms/token | 0.87x |
+
+Hardware tested, and nothing else: CUDA on a single NVIDIA L4 (23 GB, compute capability 8.9, CUDA 13.0)
+on a Colab VM; Metal on an Apple M5 (8 GPU cores, 147.5 GB/s measured streaming peak); CPU on the same
+M5's x86/ARM int8 kernels at `-t 4`. No A100/H100, no other Apple silicon, no measurement at batch
+sizes above one.
 
 **-30.0% FLOPs/token** (FFN at 65.6% of dense, head at 52.4%) and **-7.4% parameters**. On GPUs that is
 1.19-1.22x wall clock; on CPU it is a slowdown, because there ggml's dense int8 matvec already runs at
