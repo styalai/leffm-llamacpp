@@ -5,13 +5,14 @@
 
 ## Performance
 
-LFM3-1.7B Q8_0, batch-1 decode, `llama-bench -p 0 -n 32 -r 3`, best of five:
+LFM3-1.7B Q8_0, batch-1 decode, `llama-bench -p 0 -n 32 -r 3`, best of five. "basic" is stock dense
+llama.cpp, "leffm" is this fork with the cascade and the vocabulary cut.
 
-| backend | hardware | dense | cascade `c=5120 k=2304` | cascade + vocab cut |
+| backend | hardware | basic | leffm | speedup |
 | --- | --- | --- | --- | --- |
-| CUDA | L4 23 GB, sm_89 | 110.9 t/s (9.01 ms/token) | 123.7 (8.09) | **132.7 (7.54) — 1.19x** |
-| Metal | Apple M5, 8 GPU cores | 66.0 t/s (15.16 ms/token) | 75.1 (13.32) | **80.2 (12.47) — 1.22x** |
-| CPU | x86/ARM int8, `-t 4` | 43.3 t/s (23.1 ms/token) | 37.8 (26.5) | 39.9 (25.1) — **0.87x** |
+| CUDA | L4 23 GB, sm_89 | 9.01 ms/token | **7.54 ms/token** | **1.19x** |
+| Metal | Apple M5, 8 GPU cores | 15.16 ms/token | **12.47 ms/token** | **1.22x** |
+| CPU | x86/ARM int8, `-t 4` | 23.1 ms/token | 25.1 ms/token | 0.87x |
 
 **-30.0% FLOPs/token** (FFN at 65.6% of dense, head at 52.4%) and **-7.4% parameters**. On GPUs that is
 1.19-1.22x wall clock; on CPU it is a slowdown, because there ggml's dense int8 matvec already runs at
