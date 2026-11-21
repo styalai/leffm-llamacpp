@@ -452,10 +452,11 @@ void ggml_cuda_op_cascade_up(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
     CUDA_CHECK(cudaGetLastError());
 
     g_ct.start(st);
-    if (!cascade_skip("sel1"))
-    const int per1  = (c + CASCADE_SEL_BLOCK - 1)/CASCADE_SEL_BLOCK;
-    cascade_sel_kernel<false><<<1, CASCADE_SEL_BLOCK, (int) (per1*CASCADE_SEL_BLOCK*sizeof(float)), st>>>(
-        (const float *) g->data, act, lst, lsk, F, c, c, k, sel_npass());
+    if (!cascade_skip("sel1")) {
+        const int per1 = (c + CASCADE_SEL_BLOCK - 1)/CASCADE_SEL_BLOCK;
+        cascade_sel_kernel<false><<<1, CASCADE_SEL_BLOCK, (int) (per1*CASCADE_SEL_BLOCK*sizeof(float)), st>>>(
+            (const float *) g->data, act, lst, lsk, F, c, c, k, sel_npass());
+    }
     g_ct.stop(st, g_ct.sel1, g_ct.n_sel1);
     CUDA_CHECK(cudaGetLastError());
 }
