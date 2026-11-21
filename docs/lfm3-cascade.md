@@ -31,29 +31,84 @@ Selection is exact, not thresholded. CUDA and Metal use a four-pass radix select
 pattern (positive floats are monotone in their bits); thresholds cannot hold a per-token count and
 were measured to prune far less than they claim.
 
-## Measured
+## Performance by backend
 
-`llama-bench -p 0 -n 32 -r 3 -ngl 999 --no-warmup`, Q8_0 weights, no quantization of the gate or the
-gathered matrices.
+Decode at batch 1, LFM3-1.7B Q8_0, `--no-repack`, cascade `c = 5,120`, `k = 2,304` of 7,680. t/s from
+`llama-bench -p 0 -n 32 -r 3` (best of five; ms/token derived), CPU from `llama-cli -t 4` median of
+three.
 
-| arm | L4 (CUDA) | M5 (Metal) |
-| --- | --- | --- |
-| dense | 9.014 ms/token | 15.16 ms/token |
-| cascade `c=5120 k=2304` | 8.085 ms (1.09x) | 13.32 ms (1.14x) |
-| cascade + vocabulary cut | **7.537 ms (1.19x)** | **12.47 ms (1.22x)** |
+| backend | hardware | dense | cascade | cascade + vocab cut | verdict |
+| --- | --- | --- | --- | --- | --- |
+| CUDA | L4, 23 GB, sm_89, CUDA 13.0 | 110.9 t/s (9.01 ms) | 123.7 (8.09) | **132.7 (7.54)** | **1.19x** |
+| Metal | Apple M5, 8 GPU cores, 147.5 GB/s measured | 66.0 t/s (15.16 ms) | 75.1 (13.32) | **80.2 (12.47)** | **1.22x** |
+| CPU | x86/ARM, ggml int8 SIMD, `-t 4` | 43.3 t/s (23.1 ms) | 37.8 (26.5) | 39.9 (25.1) | **0.87x, loses** |
 
-The gap between "-30% FLOPs" and "1.19x" is the interesting part: at batch 1 this decode is
-bandwidth-bound, so cutting arithmetic buys less than it looks like it should, and the two selections
-cost ~11.5 µs of dispatch each. Per-stage budgets and the whole tuning ledger are in the fork's commit
-messages.
+The CPU row is the honest counterexample: ggml's dense int8 matvec already streams bytes at close to
+what the part can do, so reading fewer of them buys nothing and the selection is pure overhead. The
+GPU rows win for the opposite reason — their gathers reach 160-210 GB/s against a ~300 GB/s array, so
+halving the bytes does help, just not proportionally.
 
-Quality, measured separately on one 2.67M-token continued-pretraining run (one corpus, perplexity
-only): after matched training the cut + cascade is **+6.8% bits/byte** against a dense model trained
-for the same number of steps, and +0.082 nats zero-shot. Treat that as the price of the recipe on that
-corpus, not as a general statement.
+### Where the time goes (CUDA, per token, 24 layers)
 
-At `LLAMA_CASCADE=7680,7680` the cascade reproduces dense greedy output exactly, which is the check
-that everything below the selection is arithmetically the dense path.
+| kernel | ms/token |
+| --- | --- |
+| selection 1, gate top-c | 0.9 |
+| up gather | 1.3 |
+| selection 2, activation top-k | 0.3 |
+| down gather | 0.7 |
+| partial-sum reduction | 0.2 |
+| everything else: gate, attention, shortconv, norms, head | 5.5 |
+
+Dense spends 3.24 ms in its FFN; the cascade spends 2.51 on 52% of the bytes. The gathers run at
+~194 GB/s (up) and ~161 GB/s (down) against dense's 236 GB/s sequential matvec, which is why 30% fewer
+FLOPs is 16% less wall clock and not 30%.
+
+### Metal specifics
+
+The selection was the whole regression there as well: replacing the original 32-round bisection with
+the same radix select moved cascade from 68.2 to 75.1 t/s (+10%) and the cut arm from 72.7 to 80.2.
+After that port, ablating both selections changes throughput by less than the noise (74.6 vs 75.1), so
+the gathers are the remaining cost and the selection is effectively free. The head gather reaches
+142 GB/s of the machine's 147.5 GB/s measured streaming peak.
+
+An earlier session measured parity +-5% on Metal, but that machine was contended (paired ratios swung
+0.82-1.24 within minutes); the figures above are best-of-five on a quiet machine and supersede it.
+
+### Quality
+
+On one 2.67M-token continued-pretraining run (code/chat corpus, perplexity only, one seed): after
+matched training the cut + cascade is **+6.8% bits/byte** against a dense model trained for the same
+number of steps and +0.082 nats zero-shot. That is the price of the recipe on that corpus, not a
+general claim.
+
+## What has been tested
+
+- **Correctness, every backend**: greedy continuation identical to dense at `c = k = F` (CUDA and
+  Metal), and at 24/24 tokens for `c/k = 2560/1536`, `5120/2304` and `7680/7680` on CPU. The
+  full-FFN point is the check that the gather path is arithmetically the dense path.
+- **CUDA kernels**: radix select vs the 32-round bisection; scores in registers vs 32 KB of dynamic
+  shared memory; private histogram copies; `float4` score fetch; shared-memory bank layouts; 16-byte
+  vs 4-byte up loads; one vs two candidates per warp; the down gather with 1, 4 and 8 units in flight;
+  4 outputs per thread; one block covering `D` versus 512-byte granules; 16, 32 and 64 down slices;
+  and a fully fused selection+gather+reduction, which measured slower and was reverted.
+- **Dispatch cost**: 11.5 us per launch, measured by repeating an idempotent selection.
+- **Metal**: bisection vs radix select; down threadgroup of 128 vs 512 threads; two units per
+  simdgroup with `uint2` loads; the unit-major int8 repack; 16 threadgroups; ablation masks.
+- **CPU**: exact selection, SIMD gathered dot, the transposed repack, thread sweeps from 1 to 8.
+
+## What has not been tested
+
+- CUDA on anything but an L4 (`sm_89`): no A100/H100, no second architecture, single device only.
+- FlashAttention was **off** in every CUDA benchmark here. It changes nothing at 32-token contexts,
+  but the absolute t/s is not the default-config number.
+- Batch 1 only. The cascade applies to `T = 1`; prompt processing and any batched decode take the
+  dense path, and no server or concurrent-request behaviour was measured.
+- Metal on anything but an 8-core M5, and the down still launches 16 threadgroups (32 and 64 were not
+  retried after the scratch was enlarged to allow them).
+- Quality beyond perplexity on one corpus: no downstream benchmarks, no second seed, and the
+  continued-pretraining budget is 2.67M tokens.
+- CUDA graphs: llama.cpp captures by default, and nothing here was tuned for it beyond staying
+  capturable.
 
 ## Running it
 
