@@ -2270,7 +2270,8 @@ GGML_API struct ggml_tensor * ggml_cascade_down(
             struct ggml_tensor  * w_t,
             struct ggml_tensor  * s_t,
             struct ggml_tensor  * scratch,
-            int                   k);
+            int                   k,
+            int                   c);
 
     GGML_API struct ggml_tensor * ggml_arange(
             struct ggml_context * ctx,

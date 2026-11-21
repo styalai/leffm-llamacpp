@@ -293,94 +293,210 @@ static __device__ __forceinline__ void cascade_down_step(
     p3 += a * (float) (signed char) ((v >> 24) & 0xFF);
 }
 
-// one block per 512 outputs x one slice of the unit list; partials summed by cascade_down_reduce.
-// each thread owns 4 consecutive outputs, reads them as one 32-bit load, and keeps eight units in
-// flight: this gather is limited by bytes in flight, not by instruction count (it ran at 66 GB/s
-// against the up projection's 180).
-__global__ void cascade_down_kernel(
-        const char  * __restrict__ wt,     // [F, D] int8, unit-major
-        const __half* __restrict__ st,     // [F/32, D] f16 scales
-        const float * __restrict__ list,   // [k] ascending unit ids
-        const float * __restrict__ act,    // [F]
-        float       * __restrict__ part,   // [S, D]
-        const int D,
-        const int F,
-        const int k,
-        const int nslice) {
-    const int vec   = 4;
-    const int chunk = CASCADE_DOWN_BLOCK*vec;
-    const int nch   = (D + chunk - 1) / chunk;
-    const int sl    = blockIdx.x / nch;
-    const int ch    = blockIdx.x % nch;
-    const int o     = ch*chunk + threadIdx.x*vec;
+// CASCADE_DOWN, fused: the stage-1 selection, the gathered down dots and the partial-sum reduction in
+// one launch. Three dispatches per layer became one; a dispatch measured 11.5 us on an L4, so this
+// removes ~0.55 ms/token.
+//
+// No grid barrier is needed for either fusion:
+//   - the selection is replicated in every block (same data, same algorithm, same thread count, so the
+//     same list) and written to the block's own shared memory, which is where the gather reads it;
+//   - the reduction is done by whichever block finishes last, detected with an atomic counter, so
+//     `part` is complete by construction when that block reads it.
+__global__ void cascade_down_fused_kernel(
+        const float * __restrict__ act,      // [F] activations
+        const float * __restrict__ list_in,  // [c] stage-0 candidates, ascending
+        const char  * __restrict__ wt,       // [F, D] int8, unit-major
+        const __half* __restrict__ st,       // [F/32, D] f16 scales
+        float       * __restrict__ part,     // [S, D] partial sums
+        float       * __restrict__ y,        // [D]
+        unsigned    * __restrict__ counter,  // one counter, zero on entry and on exit
+        const int D, const int F, const int nin, const int k, const int nslice) {
+    extern __shared__ float sh[];
+    float * s    = sh;              // nin scores
+    float * list = sh + nin;        // k selected unit ids
+
+    __shared__ int  hist[256];
+    __shared__ int  scan[CASCADE_DOWN_SEL_BLOCK];
+    __shared__ int  sel_digit, sel_need;
+    __shared__ bool is_last;
+
+    const int tid = threadIdx.x;
+    const int nt  = blockDim.x;
+    const int sl  = blockIdx.x;
+
+    // ---- selection: exact top-k of |act| among the candidates (same radix as CASCADE_UP stage 1)
+    const int per_s = (nin + nt - 1) / nt;
+    for (int i = 0; i < per_s; ++i) {
+        const int t = tid*per_s + i;
+        if (t < nin) {
+            s[t] = fabsf(act[min(max((int) list_in[t], 0), F - 1)]);
+        }
+    }
+    __syncthreads();
+
+    unsigned prefix = 0u;
+    int need = k;
+    for (int sh8 = 24; sh8 >= 0; sh8 -= 8) {
+        for (int b = tid; b < 256; b += nt) {
+            hist[b] = 0;
+        }
+        if (tid == 0) {
+            sel_digit = 255;
+        }
+        __syncthreads();
+        const unsigned above = (sh8 == 24) ? 0u : (0xFFFFFFFFu << (sh8 + 8));
+        const unsigned want  = prefix & above;
+        for (int i = 0; i < per_s; ++i) {
+            const int t = tid*per_s + i;
+            if (t < nin) {
+                const unsigned bits = __float_as_uint(s[t]);
+                if ((bits & above) == want) {
+                    atomicAdd(&hist[(bits >> sh8) & 0xFF], 1);
+                }
+            }
+        }
+        __syncthreads();
+        if (tid < 32) {
+            const int lo = 8*tid;
+            const int t0 = hist[lo + 0], t1 = hist[lo + 1], t2 = hist[lo + 2], t3 = hist[lo + 3];
+            const int t4 = hist[lo + 4], t5 = hist[lo + 5], t6 = hist[lo + 6], t7 = hist[lo + 7];
+            const int tot = t0 + t1 + t2 + t3 + t4 + t5 + t6 + t7;
+            int abv = tot;                                  // inclusive suffix over the lanes
+            for (int off = 1; off < 32; off <<= 1) {
+                const int v = __shfl_down_sync(0xFFFFFFFFu, abv, off);
+                if (tid + off < 32) {
+                    abv += v;
+                }
+            }
+            const int rank = need - (abv - tot);
+            if (rank > 0 && rank <= tot) {
+                const int h[8] = {t0, t1, t2, t3, t4, t5, t6, t7};
+                int cum    = 0;
+                int digit  = lo + 7;
+                int rest   = rank;
+                bool found = false;
+                #pragma unroll
+                for (int d = 7; d >= 0; --d) {
+                    if (!found && cum + h[d] >= rank) {
+                        digit = lo + d;
+                        rest  = rank - cum;
+                        found = true;
+                    }
+                    cum += h[d];
+                }
+                sel_digit = digit;
+                sel_need  = rest;
+            }
+        }
+        __syncthreads();
+        prefix |= (unsigned) sel_digit << sh8;
+        need = sel_need;
+        __syncthreads();
+    }
+
+    int cnt = 0;
+    for (int i = 0; i < per_s; ++i) {
+        const int t = tid*per_s + i;
+        if (t < nin && __float_as_uint(s[t]) >= prefix) {
+            ++cnt;
+        }
+    }
+    scan[tid] = cnt;
+    __syncthreads();
+    for (int off = 1; off < nt; off <<= 1) {
+        const int v = (tid >= off) ? scan[tid - off] : 0;
+        __syncthreads();
+        scan[tid] += v;
+        __syncthreads();
+    }
+    int pos = scan[tid] - cnt;
+    for (int i = 0; i < per_s; ++i) {
+        const int t = tid*per_s + i;
+        if (t < nin && __float_as_uint(s[t]) >= prefix && pos < k) {
+            list[pos++] = list_in[t];
+        }
+    }
+    __syncthreads();
+
+    // ---- gathered down dots for this block's slice of the selected list
     const int per = (k + nslice - 1) / nslice;
     const int n0  = sl*per;
     const int n1  = min(n0 + per, k);
+    const int vec = 4;
+    const int o   = tid*vec;
     const int Fm1 = F - 1;
 
-    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
-    float p0 = 0.0f, p1 = 0.0f, p2 = 0.0f, p3 = 0.0f;
-    int cur_b = -1;
+    if (o + vec <= D) {
+        float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+        float p0 = 0.0f, p1 = 0.0f, p2 = 0.0f, p3 = 0.0f;
+        int cur_b = -1;
+        int n = n0;
+        for (; n + 8 <= n1; n += 8) {
+            const int u0 = min(max((int) list[n + 0], 0), Fm1);
+            const int u1 = min(max((int) list[n + 1], 0), Fm1);
+            const int u2 = min(max((int) list[n + 2], 0), Fm1);
+            const int u3 = min(max((int) list[n + 3], 0), Fm1);
+            const int u4 = min(max((int) list[n + 4], 0), Fm1);
+            const int u5 = min(max((int) list[n + 5], 0), Fm1);
+            const int u6 = min(max((int) list[n + 6], 0), Fm1);
+            const int u7 = min(max((int) list[n + 7], 0), Fm1);
+            const int v0 = *(const int *) (wt + (size_t) u0*D + o);
+            const int v1 = *(const int *) (wt + (size_t) u1*D + o);
+            const int v2 = *(const int *) (wt + (size_t) u2*D + o);
+            const int v3 = *(const int *) (wt + (size_t) u3*D + o);
+            const int v4 = *(const int *) (wt + (size_t) u4*D + o);
+            const int v5 = *(const int *) (wt + (size_t) u5*D + o);
+            const int v6 = *(const int *) (wt + (size_t) u6*D + o);
+            const int v7 = *(const int *) (wt + (size_t) u7*D + o);
+            cascade_down_step(u0, v0, D, o, st, act, cur_b, a0, a1, a2, a3, p0, p1, p2, p3);
+            cascade_down_step(u1, v1, D, o, st, act, cur_b, a0, a1, a2, a3, p0, p1, p2, p3);
+            cascade_down_step(u2, v2, D, o, st, act, cur_b, a0, a1, a2, a3, p0, p1, p2, p3);
+            cascade_down_step(u3, v3, D, o, st, act, cur_b, a0, a1, a2, a3, p0, p1, p2, p3);
+            cascade_down_step(u4, v4, D, o, st, act, cur_b, a0, a1, a2, a3, p0, p1, p2, p3);
+            cascade_down_step(u5, v5, D, o, st, act, cur_b, a0, a1, a2, a3, p0, p1, p2, p3);
+            cascade_down_step(u6, v6, D, o, st, act, cur_b, a0, a1, a2, a3, p0, p1, p2, p3);
+            cascade_down_step(u7, v7, D, o, st, act, cur_b, a0, a1, a2, a3, p0, p1, p2, p3);
+        }
+        for (; n < n1; ++n) {
+            const int u = min(max((int) list[n], 0), Fm1);
+            const int v = *(const int *) (wt + (size_t) u*D + o);
+            cascade_down_step(u, v, D, o, st, act, cur_b, a0, a1, a2, a3, p0, p1, p2, p3);
+        }
+        if (cur_b >= 0) {
+            const __half * sp = st + (size_t) cur_b*D + o;
+            a0 += p0 * __half2float(sp[0]);
+            a1 += p1 * __half2float(sp[1]);
+            a2 += p2 * __half2float(sp[2]);
+            a3 += p3 * __half2float(sp[3]);
+        }
+        part[(size_t) sl*D + o    ] = a0;
+        part[(size_t) sl*D + o + 1] = a1;
+        part[(size_t) sl*D + o + 2] = a2;
+        part[(size_t) sl*D + o + 3] = a3;
+    }
 
-    int n = n0;
-    for (; n + 8 <= n1; n += 8) {
-        const int u0 = min(max((int) list[n + 0], 0), Fm1);
-        const int u1 = min(max((int) list[n + 1], 0), Fm1);
-        const int u2 = min(max((int) list[n + 2], 0), Fm1);
-        const int u3 = min(max((int) list[n + 3], 0), Fm1);
-        const int u4 = min(max((int) list[n + 4], 0), Fm1);
-        const int u5 = min(max((int) list[n + 5], 0), Fm1);
-        const int u6 = min(max((int) list[n + 6], 0), Fm1);
-        const int u7 = min(max((int) list[n + 7], 0), Fm1);
-        const int v0 = *(const int *) (wt + (size_t) u0*D + o);
-        const int v1 = *(const int *) (wt + (size_t) u1*D + o);
-        const int v2 = *(const int *) (wt + (size_t) u2*D + o);
-        const int v3 = *(const int *) (wt + (size_t) u3*D + o);
-        const int v4 = *(const int *) (wt + (size_t) u4*D + o);
-        const int v5 = *(const int *) (wt + (size_t) u5*D + o);
-        const int v6 = *(const int *) (wt + (size_t) u6*D + o);
-        const int v7 = *(const int *) (wt + (size_t) u7*D + o);
-        cascade_down_step(u0, v0, D, o, st, act, cur_b, a0, a1, a2, a3, p0, p1, p2, p3);
-        cascade_down_step(u1, v1, D, o, st, act, cur_b, a0, a1, a2, a3, p0, p1, p2, p3);
-        cascade_down_step(u2, v2, D, o, st, act, cur_b, a0, a1, a2, a3, p0, p1, p2, p3);
-        cascade_down_step(u3, v3, D, o, st, act, cur_b, a0, a1, a2, a3, p0, p1, p2, p3);
-        cascade_down_step(u4, v4, D, o, st, act, cur_b, a0, a1, a2, a3, p0, p1, p2, p3);
-        cascade_down_step(u5, v5, D, o, st, act, cur_b, a0, a1, a2, a3, p0, p1, p2, p3);
-        cascade_down_step(u6, v6, D, o, st, act, cur_b, a0, a1, a2, a3, p0, p1, p2, p3);
-        cascade_down_step(u7, v7, D, o, st, act, cur_b, a0, a1, a2, a3, p0, p1, p2, p3);
+    // ---- reduction by the last block to arrive, so no separate dispatch and no grid barrier
+    __threadfence();
+    if (tid == 0) {
+        const unsigned prev = atomicAdd(counter, 1u);
+        is_last = prev == (unsigned) (nslice - 1);
+        if (is_last) {
+            atomicExch(counter, 0u);   // leave it zeroed for the next launch
+        }
     }
-    for (; n < n1; ++n) {
-        const int u = min(max((int) list[n], 0), Fm1);
-        const int v = *(const int *) (wt + (size_t) u*D + o);
-        cascade_down_step(u, v, D, o, st, act, cur_b, a0, a1, a2, a3, p0, p1, p2, p3);
-    }
-    if (cur_b >= 0) {
-        const __half * sp = st + (size_t) cur_b*D + o;
-        a0 += p0 * __half2float(sp[0]);
-        a1 += p1 * __half2float(sp[1]);
-        a2 += p2 * __half2float(sp[2]);
-        a3 += p3 * __half2float(sp[3]);
-    }
-    part[(size_t) sl*D + o    ] = a0;
-    part[(size_t) sl*D + o + 1] = a1;
-    part[(size_t) sl*D + o + 2] = a2;
-    part[(size_t) sl*D + o + 3] = a3;
-}
-
-__global__ void cascade_down_reduce_kernel(
-        const float * __restrict__ part,   // [S, D]
-        float       * __restrict__ y,      // [D]
-        const int D,
-        const int nslice) {
-    const int o = blockIdx.x*blockDim.x + threadIdx.x;
-    if (o >= D) {
+    __syncthreads();
+    if (!is_last) {
         return;
     }
-    float s = 0.0f;
-    for (int t = 0; t < nslice; ++t) {
-        s += part[(size_t) t*D + o];
+    __threadfence();
+    for (int o = tid*vec; o + vec <= D; o += vec*nt) {
+        float4 acc = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        for (int t = 0; t < nslice; ++t) {
+            const float4 p = *(const float4 *) (part + (size_t) t*D + o);
+            acc.x += p.x; acc.y += p.y; acc.z += p.z; acc.w += p.w;
+        }
+        *(float4 *) (y + o) = acc;
     }
-    y[o] = s;
 }
 
 __global__ void cascade_expand_kernel(
@@ -469,7 +585,6 @@ void ggml_cuda_op_cascade_up(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
     float * sel = (float *) dst->data;
     float * act = sel;                        // row 0
     float * lst = sel + F;                    // row 1 (stage-0 list)
-    float * lsk = sel + 2*F;                  // row 2 (stage-1 list)
 
     cudaStream_t st = ctx.stream();
     const int shmem = 0;      // the scores are in registers
@@ -496,13 +611,7 @@ void ggml_cuda_op_cascade_up(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
     g_ct.stop(st, g_ct.up, g_ct.n_up);
     CUDA_CHECK(cudaGetLastError());
 
-    g_ct.start(st);
-    if (!cascade_skip("sel1")) {
-            cascade_sel_kernel<false><<<1, CASCADE_SEL_BLOCK, 0, st>>>(
-            (const float *) g->data, act, lst, lsk, F, c, c, k, sel_npass());
-    }
-    g_ct.stop(st, g_ct.sel1, g_ct.n_sel1);
-    CUDA_CHECK(cudaGetLastError());
+    // the stage-1 selection runs inside CASCADE_DOWN, fused with the gather and the reduction
 }
 
 // CASCADE_CUDA_SLICES overrides the down split (default CASCADE_DOWN_SLICES, max 64): the gathers are
@@ -523,39 +632,47 @@ static int cascade_down_slices() {
 }
 
 void ggml_cuda_op_cascade_down(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    const ggml_tensor * sel  = dst->src[0];
-    const ggml_tensor * wt   = dst->src[2];
-    const ggml_tensor * st   = dst->src[3];
-    const ggml_tensor * sp   = dst->src[4];
+    const ggml_tensor * sel = dst->src[0];
+    const ggml_tensor * wt  = dst->src[2];
+    const ggml_tensor * st  = dst->src[3];
+    const ggml_tensor * sp  = dst->src[4];
 
     const int D = (int) dst->ne[0];
+    const int F = (int) sel->ne[0];
     const int k = ggml_get_op_params_i32(dst, 0);
+    const int nin = ggml_get_op_params_i32(dst, 1);   // candidates scored by the fused selection
     const int S = cascade_down_slices();
 
-    const float * act  = (const float *) sel->data;
-    const float * list = (const float *) sel->data + 2*sel->ne[0];
+    if (cascade_skip("down")) {
+        return;
+    }
+    const float * act     = (const float *) sel->data;
+    const float * list_in = act + F;                 // stage-0 candidates
+    // the counter lives in the last row of the scratch, which is sized for SLICES_MAX + 1 rows
+    unsigned * counter = (unsigned *) ((float *) sp->data + (size_t) GGML_CASCADE_DOWN_SLICES_MAX * D);
 
-    cudaStream_t s = ctx.stream();
-    const int F = (int) sel->ne[0];
-    g_ct.start(s);
-    if (!cascade_skip("down"))
-    cascade_down_kernel<<<((D + CASCADE_DOWN_BLOCK*4 - 1)/(CASCADE_DOWN_BLOCK*4))*S, CASCADE_DOWN_BLOCK, 0, s>>>(
-        (const char *) wt->data, (const __half *) st->data, list, act,
-        (float *) sp->data, D, F, k, S);
-    g_ct.stop(s, g_ct.down, g_ct.n_down);
-    CUDA_CHECK(cudaGetLastError());
-
-    g_ct.start(s);
-    if (!cascade_skip("reduce"))
-    cascade_down_reduce_kernel<<<(D + 255)/256, 256, 0, s>>>(
-        (const float *) sp->data, (float *) dst->data, D, S);
-    g_ct.stop(s, g_ct.reduce, g_ct.n_reduce);
-    if (g_ct.on && g_ct.n_reduce % 24 == 0) {
-        g_ct.dump();
-        if (g_ct.n_up >= 48) {
-            g_ct.on = false;    // stop before graph capture, which cannot contain a blocking sync
+    // it must start at zero; the last block leaves it at zero, so this happens once per buffer
+    {
+        static std::vector<const void *> seen;
+        bool fresh = true;
+        for (const void * p : seen) {
+            if (p == sp->data) { fresh = false; break; }
+        }
+        if (fresh) {
+            seen.push_back(sp->data);
+            CUDA_CHECK(cudaMemsetAsync(counter, 0, sizeof(unsigned), ctx.stream()));
         }
     }
+
+    GGML_ASSERT(nin > 0 && nin <= F && k > 0 && k <= nin);
+
+    const size_t shmem = (size_t) (nin + k) * sizeof(float);
+    g_ct.start(ctx.stream());
+    cascade_down_fused_kernel<<<S, CASCADE_DOWN_SEL_BLOCK, shmem, ctx.stream()>>>(
+        act, list_in, (const char *) wt->data, (const __half *) st->data,
+        (float *) sp->data, (float *) dst->data, counter,
+        D, F, nin, k, S);
+    g_ct.stop(ctx.stream(), g_ct.down, g_ct.n_down);
     CUDA_CHECK(cudaGetLastError());
 }
 

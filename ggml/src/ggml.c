@@ -5428,7 +5428,8 @@ struct ggml_tensor * ggml_cascade_down(
         struct ggml_tensor  * w_t,
         struct ggml_tensor  * s_t,
         struct ggml_tensor  * scratch,
-        int                   k) {
+        int                   k,
+        int                   c) {
     GGML_ASSERT(sel->type == GGML_TYPE_F32);
     GGML_ASSERT(w_down->ne[0] == sel->ne[0]);
 
@@ -5441,6 +5442,7 @@ struct ggml_tensor * ggml_cascade_down(
     result->src[3] = s_t;
     result->src[4] = scratch;
     ggml_set_op_params_i32(result, 0, k);
+    ggml_set_op_params_i32(result, 1, c);   // candidates the fused selection scores
 
     return result;
 }
