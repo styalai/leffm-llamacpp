@@ -50,13 +50,31 @@ __global__ void cascade_sel_kernel(
 
     // the block covers nt*per >= nin slots and only [0, nin) exists in shared memory: the padding
     // must not be written (every later read is guarded by t < nin)
-    for (int i = 0; i < per; ++i) {
-        const int t = tid*per + i;
-        if (t < nin) {
-            if (STAGE0) {
-                const float gv = g[t];
+    if (STAGE0 && per == 8) {
+        // One block reads the whole score array, so the fetch is latency-bound: eight scalar loads
+        // per thread leave about a kilobyte in flight, which costs ~25 us per layer. Two 16-byte
+        // loads per thread cut the requests fourfold and keep a warp's accesses contiguous.
+        float4 a0, a1;
+        const int  base = tid*per;
+        if (base + 8 <= nin) {
+            a0 = *(const float4 *) (g + base);
+            a1 = *(const float4 *) (g + base + 4);
+        } else {
+            a0 = a1 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        }
+        const float v[8] = { a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w };
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const int t = base + i;
+            if (t < nin) {
+                const float gv = v[i];
                 s[i*nt + tid] = fabsf(gv / (1.0f + __expf(-gv)));
-            } else {
+            }
+        }
+    } else {
+        for (int i = 0; i < per; ++i) {
+            const int t = tid*per + i;
+            if (t < nin) {
                 s[i*nt + tid] = fabsf(act[min(max((int) list_in[t], 0), F - 1)]);
             }
         }
