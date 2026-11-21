@@ -2059,6 +2059,32 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     if (hparams.rope_section_order != LLAMA_ROPE_SECTION_ORDER_TYXZ && hparams.n_pos_per_embd() != 4) {
         throw std::runtime_error("rope section order " + llama_rope_section_order_name(hparams.rope_section_order) + " requires M-RoPE");
     }
+
+    // cascade FFN: a converted cascade checkpoint carries its operating point, so the model runs the
+    // cascade with no environment variable. LLAMA_CASCADE="c,k" overrides it; "0,0" turns it off.
+    ml.get_key(LLM_KV_CASCADE_C, hparams.cascade_c, false);
+    ml.get_key(LLM_KV_CASCADE_K, hparams.cascade_k, false);
+    if (hparams.cascade_c != 0 && (hparams.cascade_k == 0 || hparams.cascade_k > hparams.cascade_c)) {
+        throw std::runtime_error("invalid cascade operating point in the model: c=" +
+                std::to_string(hparams.cascade_c) + " k=" + std::to_string(hparams.cascade_k));
+    }
+    const char * env_cascade = getenv("LLAMA_CASCADE");
+    if (env_cascade != nullptr) {
+        int cc = 0, kk = 0;
+        if (sscanf(env_cascade, "%d,%d", &cc, &kk) == 2 && cc >= 0 && kk >= 0 && cc >= kk &&
+                (cc == 0 || kk > 0) && cc <= (int) hparams.n_ff()) {
+            hparams.cascade_c = (uint32_t) cc;
+            hparams.cascade_k = (uint32_t) kk;
+        } else {
+            LLAMA_LOG_WARN("%s: ignoring LLAMA_CASCADE=%s (want \"c,k\" with n_ff >= c >= k > 0, or 0,0)\n",
+                    __func__, env_cascade);
+        }
+    }
+    if (hparams.cascade_c != 0) {
+        LLAMA_LOG_INFO("%s: cascade FFN: c = %u, k = %u (%s)\n", __func__,
+                hparams.cascade_c, hparams.cascade_k,
+                env_cascade != nullptr ? "LLAMA_CASCADE" : "model metadata");
+    }
 }
 
 void llama_model_base::load_vocab(llama_model_loader & ml) {
@@ -2110,7 +2136,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         __func__, load_mode_name);
 
     // build a list of buffer types for the CPU and GPU devices
-    pimpl->cpu_buft_list = make_cpu_buft_list(devices, params.use_extra_bufts, params.no_host);
+    // the cascade reads ffn_up/ffn_down as stored Q8_0, so a model that runs it must not be repacked
+    pimpl->cpu_buft_list = make_cpu_buft_list(devices, params.use_extra_bufts && hparams.cascade_c == 0, params.no_host);
     for (const auto & dev : devices) {
         buft_list_t buft_list = make_gpu_buft_list(dev.dev, split_mode, tensor_split);
         // add CPU buffer types as a fallback

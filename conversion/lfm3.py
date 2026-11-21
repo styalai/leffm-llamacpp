@@ -110,6 +110,15 @@ class LFM3Model(TextModel):
 
         self.gguf_writer.add_shortconv_l_cache(self.hparams["conv_L_cache"])
 
+        # a cascade checkpoint carries its stage-1/stage-2 operating point, so llama.cpp runs the
+        # cascade from the file alone (LLAMA_CASCADE still overrides it)
+        cascade_cfg = self.dir_model / "cascade_config.json"
+        if cascade_cfg.is_file():
+            with open(cascade_cfg, encoding="utf-8") as f:
+                cc = json.load(f)
+            self.gguf_writer.add_uint32("lfm3.cascade.c", int(cc["c"]))
+            self.gguf_writer.add_uint32("lfm3.cascade.k", int(cc["k"]))
+
     def generate_extra_tensors(self) -> Iterable[tuple[str, Tensor]]:
         # Partial RoPE is represented by masking trailing frequency pairs.
         # rope_parameters is keyed by layer type; only full_attention layers use partial RoPE.

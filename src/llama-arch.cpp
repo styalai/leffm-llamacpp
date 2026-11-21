@@ -455,6 +455,9 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_LILICORR_MLP_HIDDEN_SIZE,   "lilicorr.mlp_hidden_size"  },
 
     { LLM_KV_SHORTCONV_L_CACHE, "%s.shortconv.l_cache" },
+
+    { LLM_KV_CASCADE_C, "%s.cascade.c" },
+    { LLM_KV_CASCADE_K, "%s.cascade.k" },
     // sentence-transformers dense modules feature dims
     { LLM_KV_DENSE_2_FEAT_IN,        "%s.dense_2_feat_in"  },
     { LLM_KV_DENSE_2_FEAT_OUT,       "%s.dense_2_feat_out" },

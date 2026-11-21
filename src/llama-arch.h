@@ -503,6 +503,10 @@ enum llm_kv {
 
     LLM_KV_SHORTCONV_L_CACHE,
 
+    // LFM3 cascade FFN operating point: c candidate units, k of them kept (see LLAMA_CASCADE)
+    LLM_KV_CASCADE_C,
+    LLM_KV_CASCADE_K,
+
     LLM_KV_XIELU_ALPHA_N,
     LLM_KV_XIELU_ALPHA_P,
     LLM_KV_XIELU_BETA,

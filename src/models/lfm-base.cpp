@@ -132,24 +132,6 @@ ggml_tensor * llm_build_lfm_base::build_lfm_cascade_ffn(ggml_tensor * cur, int i
     return y;
 }
 
-static bool lfm_cascade_cfg(int & c, int & k) {
-    static int sc = -1, sk = -1;
-    if (sc < 0) {
-        sc = 0; sk = 0;
-        const char * e = getenv("LLAMA_CASCADE");
-        if (e != nullptr) {
-            int cc = 0, kk = 0;
-            if (sscanf(e, "%d,%d", &cc, &kk) == 2 && kk > 0 && cc >= kk) {
-                sc = cc; sk = kk;
-            } else {
-                fprintf(stderr, "%s: ignoring LLAMA_CASCADE=%s (want \"c,k\" with c >= k > 0)\n", __func__, e);
-            }
-        }
-    }
-    c = sc; k = sk;
-    return sc > 0;
-}
-
 ggml_tensor * llm_build_lfm_base::build_lfm_dense_ffn(ggml_tensor * cur,
                                                       int il) {
     {   // timing ablation: remove the whole FFN from the graph (wrong output, speed only)
@@ -164,8 +146,11 @@ ggml_tensor * llm_build_lfm_base::build_lfm_dense_ffn(ggml_tensor * cur,
             return cur;
         }
     }
-    int cascade_c = 0, cascade_k = 0;
-    if (cur->ne[1] == 1 && cur->ne[2] == 1 && cur->ne[3] == 1 && lfm_cascade_cfg(cascade_c, cascade_k)) {
+    // the operating point is resolved at load time from the model metadata, with LLAMA_CASCADE as an
+    // override; batch 1 is the only shape the cascade supports
+    const int cascade_c = (int) model.hparams.cascade_c;
+    const int cascade_k = (int) model.hparams.cascade_k;
+    if (cur->ne[1] == 1 && cur->ne[2] == 1 && cur->ne[3] == 1 && cascade_c > 0) {
         return build_lfm_cascade_ffn(cur, il, cascade_c, cascade_k);
     }
     GGML_ASSERT(!model.layers[il].ffn_up_b);

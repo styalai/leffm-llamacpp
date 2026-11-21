@@ -121,6 +121,10 @@ struct llama_hparams {
     uint32_t n_layer_dense_lead = 0;
     uint32_t n_lora_q           = 0;
     uint32_t n_lora_kv          = 0;
+    // LFM3 cascade FFN operating point read from the model, 0 when absent (see LLAMA_CASCADE)
+    uint32_t cascade_c          = 0;
+    uint32_t cascade_k          = 0;
+
     uint32_t n_ff_shexp         = 0;
     uint32_t n_ff_chexp         = 0;
     uint32_t n_expert_shared    = 0;

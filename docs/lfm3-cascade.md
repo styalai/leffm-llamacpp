@@ -156,11 +156,19 @@ cmake --build build -j --target llama-cli llama-bench
 # Metal: the default build on macOS
 cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j --target llama-cli
 
-# dense baseline, then the cascade, then the cascade with the id cut
+# a converted cascade checkpoint: operating point in the GGUF, repack disabled by the file itself
+./build/bin/llama-cli -m lfm3-1.7b-cascade-30-Q8_0.gguf -p "..." -n 32
+
+# the stock 128k model: dense baseline, then the cascade, then the cascade with the id cut
 ./build/bin/llama-cli -m LFM3-1.7B-Q8_0.gguf -p "..." -n 32 --no-repack
 LLAMA_CASCADE=5120,2304 ./build/bin/llama-cli -m ... --no-repack
 LLAMA_CASCADE=5120,2304 LLAMA_CASCADE_VOCAB=trim_ids.txt ./build/bin/llama-cli -m ... --no-repack
 ```
+
+A converted cascade checkpoint writes `lfm3.cascade.c` and `lfm3.cascade.k` (from its
+`cascade_config.json`), so the runtime needs no `LLAMA_CASCADE` at all; the variable still overrides
+the file, and `LLAMA_CASCADE=0,0` runs the same weights with the dense FFN. Those files also skip the
+Q8_0 repack automatically, because the cascade reads the stored layout.
 
 `LLAMA_CASCADE_VOCAB` is a text file of kept ids, one per line, ascending. The same list must have been
 used to build the model's trimmed head and embedding, otherwise the ids point at the wrong rows.

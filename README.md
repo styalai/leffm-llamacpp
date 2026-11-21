@@ -65,7 +65,20 @@ cmake --build build -j --target llama-cli llama-bench
 hf download LiquidAI/LFM3-1.7B-GGUF LFM3-1.7B-Q8_0.gguf --local-dir .
 ```
 
-Run leffm (cascade 5120/2304 + vocabulary cut):
+A converted cascade checkpoint carries its operating point in the GGUF (`lfm3.cascade.c` /
+`lfm3.cascade.k`), so the cascade needs no flags, no vocabulary file and no `--no-repack` — the repack
+is disabled by the file itself:
+
+```sh
+./build/bin/llama-cli -m lfm3-1.7b-cascade-30-Q8_0.gguf -p "The quick brown fox" -n 32
+```
+
+Such a model is already vocabulary-cut and its tokenizer lives in the GGUF, so `LLAMA_CASCADE_VOCAB`
+does not apply. `LLAMA_CASCADE=0,0` turns the cascade off on the same weights (dense FFN), and
+`LLAMA_CASCADE="c,k"` overrides the file's operating point.
+
+To reproduce the table above from the **stock 128k** model, where the cut happens at load time and the
+cascade is not in the file, the flags are explicit:
 
 ```sh
 LLAMA_CASCADE=5120,2304 LLAMA_CASCADE_VOCAB=docs/lfm3-trim-ids.txt \
@@ -81,7 +94,8 @@ LLAMA_CASCADE=5120,2304 LLAMA_CASCADE_VOCAB=docs/lfm3-trim-ids.txt \
 
 `docs/lfm3-trim-ids.txt` is the 65,536-id set the numbers above were measured with. The head and tied
 embedding are trimmed **at load time** from the stock 128k weights, so no custom model file is needed.
-`--no-repack` and Q8_0 weights are required. Omit `LLAMA_CASCADE` for the stock dense model, or
+On that path `--no-repack` and Q8_0 weights are required; a checkpoint that carries `lfm3.cascade.c/k`
+disables the repack itself. Omit `LLAMA_CASCADE` (or set `0,0`) for the stock dense model, and
 `LLAMA_CASCADE_VOCAB` for the cascade without the cut.
 
 ## How it works
