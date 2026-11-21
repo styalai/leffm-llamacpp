@@ -81,10 +81,20 @@ An earlier session measured parity +-5% on Metal, but that machine was contended
 
 ### Quality
 
-On one 2.67M-token continued-pretraining run (code/chat corpus, perplexity only, one seed): after
-matched training the cut + cascade is **+6.8% bits/byte** against a dense model trained for the same
-number of steps and +0.082 nats zero-shot. That is the price of the recipe on that corpus, not a
-general claim.
+One matched continued-pretraining run (2.67M tokens, code/chat corpus, perplexity only, one seed),
+evaluated on a held-out slice of the same corpus (64 sequences, 115,159 bytes):
+
+| arm | PPL/token | bits/byte |
+| --- | ---: | ---: |
+| stock LFM3-1.7B, no training | 3.392 | 0.4270 |
+| dense, after CPT | **2.832** | **0.3639** |
+| cut + cascade, no training | 3.684 | 0.4563 |
+| cut + cascade, after CPT | **3.035** | **0.3885** |
+
+Against dense at matched training, the cut + cascade costs **+0.069 nats (+6.8% bits/byte)**;
+zero-shot, before any training, +0.082 nats. The cut tokenizer needs 1.004x as many tokens for the
+same text, so bits/byte is the comparable column. That is the price of the recipe on that corpus,
+not a general claim.
 
 ## What has been tested
 
