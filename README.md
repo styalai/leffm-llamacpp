@@ -29,14 +29,22 @@ both nth_element selections with a radix select brought it to 1.00-1.05x across 
 
 ### Quality trade-off
 
-After one matched continued-pretraining run (2.67M tokens, single corpus, perplexity only):
+Perplexity on a held-out slice of the same corpus (64 sequences, 115,159 bytes), after one matched
+continued-pretraining run of 2.67M tokens — dense and leffm trained for the same 163 steps:
 
-- **+6.8% bits/byte** against a dense model trained for the same number of steps;
-- **+0.082 nats** zero-shot, before any training.
+| arm | PPL/token | bits/byte |
+| --- | ---: | ---: |
+| stock LFM3-1.7B, no training | 3.392 | 0.4270 |
+| dense, after CPT | **2.832** | **0.3639** |
+| leffm, no training | 3.684 | 0.4563 |
+| leffm, after CPT | **3.035** | **0.3885** |
 
-No benchmark suite beyond perplexity was run, so treat these as the price on that corpus, not as a
-general statement. At `LLAMA_CASCADE=7680,7680` the cascade reproduces dense greedy output exactly,
-which is the check that everything below the selection is arithmetically the dense path.
+Against the dense model at matched training, leffm costs **+0.069 nats (+6.8% bits/byte)**; zero-shot,
+before any training, **+0.082 nats**. The two tokenizations differ slightly (the cut tokenizer needs
+1.004x as many tokens for the same text), so bits/byte is the comparable column. No benchmark suite
+beyond perplexity was run — treat these as the price on this corpus, not as a general statement.
+At `LLAMA_CASCADE=7680,7680` the cascade reproduces dense greedy output exactly, which is the check
+that everything below the selection is arithmetically the dense path.
 
 ## Usage
 
