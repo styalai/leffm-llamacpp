@@ -2609,6 +2609,87 @@ static void cascade_perf(int which, double us) {
     }
 }
 
+// exact top-`keep` of non-negative scores: four 8-bit radix passes over the bit pattern (positive
+// floats are monotone in their bits). Single-threaded and atomic-free: the histogram is a plain
+// array and each pass compacts the survivors. Replaces nth_element in both selection phases, which
+// cost ~79 us (phase 1) and ~50 us (phase 3) per layer with its id-gather comparators.
+static void cascade_radix_topn(const float * v, int n, int keep, int32_t * out) {
+    std::vector<int32_t> cur(n), nxt(n);
+    for (int i = 0; i < n; ++i) {
+        cur[i] = i;
+    }
+    int nc = n, need = keep, taken = 0;
+    unsigned prefix = 0u;
+    for (int sh = 24; sh >= 0 && nc > need; sh -= 8) {
+        int h[256] = {0};
+        const unsigned above = (sh == 24) ? 0u : (0xFFFFFFFFu << (sh + 8));
+        for (int i = 0; i < nc; ++i) {
+            unsigned b;
+            memcpy(&b, v + cur[i], sizeof(b));
+            if ((b & above) == (prefix & above)) {
+                ++h[(b >> sh) & 0xFF];
+            }
+        }
+        int cum = 0, digit = 0;
+        for (int d = 255; d >= 0; --d) {
+            if (cum + h[d] >= need) {
+                digit = d;
+                break;
+            }
+            cum += h[d];
+        }
+        int m = 0;
+        for (int i = 0; i < nc; ++i) {
+            unsigned b;
+            memcpy(&b, v + cur[i], sizeof(b));
+            if ((b & above) != (prefix & above)) {
+                continue;
+            }
+            const int d = (int) ((b >> sh) & 0xFF);
+            if (d > digit) {
+                out[taken++] = cur[i];      // above the threshold digit: already has a slot
+            } else if (d == digit) {
+                nxt[m++] = cur[i];
+            }
+        }
+        need -= cum;
+        std::swap(cur, nxt);
+        nc = m;
+        prefix |= (unsigned) digit << sh;
+    }
+    // survivors share the threshold's whole bit pattern (ties); take exactly what is left, as
+    // nth_element did with its own arbitrary tie order
+    for (int i = 0; i < keep - taken && i < nc; ++i) {
+        out[taken + i] = cur[i];
+    }
+}
+
+// debug gate: the radix select must return exactly the top-`keep` values nth_element would. Unit
+// test on random data lives in the commit that introduced the radix; this catches a regression on
+// real activations. Off unless LLAMA_CASCADE_VERIFY_SEL is set (it costs an nth_element per layer).
+static void cascade_verify_sel(const float * v, int n, int keep, const int32_t * got, const char * tag) {
+    std::vector<int32_t> ref((size_t) n);
+    for (int i = 0; i < n; ++i) {
+        ref[i] = i;
+    }
+    std::nth_element(ref.begin(), ref.begin() + keep, ref.end(),
+                     [v](int32_t a, int32_t b) { return v[a] > v[b]; });
+    std::vector<float> a((size_t) keep), b((size_t) keep);
+    for (int i = 0; i < keep; ++i) {
+        a[i] = v[got[i]];
+        b[i] = v[ref[i]];
+    }
+    std::sort(a.begin(), a.end(), [](float x, float y) { return x > y; });
+    std::sort(b.begin(), b.end(), [](float x, float y) { return x > y; });
+    for (int i = 0; i < keep; ++i) {
+        if (a[i] != b[i]) {
+            fprintf(stderr, "[cascade] VERIFY FAIL %s: n %d keep %d at %d radix %.9g ref %.9g\n",
+                    tag, n, keep, i, (double) a[i], (double) b[i]);
+            abort();
+        }
+    }
+}
+
 // ggml_compute_forward_cascade_up
 //
 // LFM3 cascade FFN, stage 1.  dst is [F, 3] f32:
@@ -2659,15 +2740,21 @@ void ggml_compute_forward_cascade_up(const struct ggml_compute_params * params,
     ggml_barrier(params->threadpool);
 
     if (ith == 0) {
-        std::vector<int32_t> ids((size_t) F);
-        for (int64_t j = 0; j < F; ++j) {
-            ids[j] = (int32_t) j;
+        std::vector<int32_t> ids((size_t) c);
+        cascade_radix_topn(s, (int) F, (int) c, ids.data());
+        if (getenv("LLAMA_CASCADE_VERIFY_SEL")) {
+            cascade_verify_sel(s, (int) F, (int) c, ids.data(), "up");
         }
-        std::nth_element(ids.begin(), ids.begin() + c, ids.end(),
-                         [s](int32_t a, int32_t b) { return s[a] > s[b]; });
         if (getenv("LLAMA_CASCADE_MARGIN")) {
-            float s_c = s[ids[c-1]], s_n = 0.0f;
-            for (int64_t i = c; i < F; ++i) { s_n = MAX(s_n, s[ids[i]]); }
+            unsigned thr_bits;
+            memcpy(&thr_bits, s + ids[0], sizeof(thr_bits));   // any survivor sits at the threshold
+            float s_c, s_n = 0.0f;
+            memcpy(&s_c, &thr_bits, sizeof(s_c));
+            for (int64_t j = 0; j < F; ++j) {
+                unsigned b;
+                memcpy(&b, s + j, sizeof(b));
+                if (b < thr_bits) { s_n = MAX(s_n, s[j]); }
+            }
             fprintf(stderr, "[cascade] up  margin: c-th %.7g  next %.7g  rel %.3g\n",
                     (double) s_c, (double) s_n, (double) (s_c - s_n) / (double) s_c);
         }
@@ -2701,8 +2788,9 @@ void ggml_compute_forward_cascade_up(const struct ggml_compute_params * params,
             }
             float acc = 0.0f;
             dot((int) d, &acc, 0, rp, 0, xq, 0, 1);
-            const float gv = gp[j];
-            act[i] = (gv / (1.0f + expf(-gv))) * acc;
+            // silu keeps the sign of g and the score pass left |silu(g)| unit-indexed in row 0,
+            // so the second expf per selected row is redundant; signbit keeps -0 round-trip
+            act[i] = (signbit(gp[j]) ? -s[j] : s[j]) * acc;
         }
         free(xq);
     }
@@ -2710,16 +2798,24 @@ void ggml_compute_forward_cascade_up(const struct ggml_compute_params * params,
 
     // ---- phase 3 (thread 0): exact top-k of |act|, compacted in ascending order
     if (ith == 0) {
-        std::vector<int32_t> ids((size_t) c);
         for (int i = 0; i < c; ++i) {
-            ids[i] = i;
-            s[i] = fabsf(act[i]);          // row 0 is free: comparators then do no fabsf work
+            s[i] = fabsf(act[i]);          // row 0 is free: the radix pass then does no fabsf work
         }
-        std::nth_element(ids.begin(), ids.begin() + k, ids.end(),
-                         [s](int32_t a, int32_t b) { return s[a] > s[b]; });
+        std::vector<int32_t> ids((size_t) k);
+        cascade_radix_topn(s, (int) c, (int) k, ids.data());
+        if (getenv("LLAMA_CASCADE_VERIFY_SEL")) {
+            cascade_verify_sel(s, (int) c, (int) k, ids.data(), "down");
+        }
         if (getenv("LLAMA_CASCADE_MARGIN")) {
-            float a_k = s[ids[k-1]], a_n = 0.0f;
-            for (int i = k; i < c; ++i) { a_n = MAX(a_n, s[ids[i]]); }
+            unsigned thr_bits;
+            memcpy(&thr_bits, s + ids[0], sizeof(thr_bits));
+            float a_k, a_n = 0.0f;
+            memcpy(&a_k, &thr_bits, sizeof(a_k));
+            for (int i = 0; i < c; ++i) {
+                unsigned b;
+                memcpy(&b, s + i, sizeof(b));
+                if (b < thr_bits) { a_n = MAX(a_n, s[i]); }
+            }
             fprintf(stderr, "[cascade] down margin: k-th %.7g  next %.7g  rel %.3g\n",
                     (double) a_k, (double) a_n, (double) (a_k - a_n) / (double) a_k);
         }
