@@ -14,7 +14,7 @@ Batch-1 decode, LFM3-1.7B Q8_0, `llama-bench -p 0 -n 32 -r 3`, best of five. "de
 | --- | ---: | ---: | ---: |
 | CUDA (L4) | 9.01 ms/token | **7.54 ms/token** | **1.19x** |
 | Metal (M5) | 15.16 ms/token | **12.47 ms/token** | **1.22x** |
-| CPU (M5, `-t 4`) | 23.1 ms/token | 25.1 ms/token | 0.87x |
+| CPU (M5, `-t 4`) | 22.6 ms/token | **22.5 ms/token** | **1.00x** |
 
 The two changes reduce:
 
@@ -23,8 +23,9 @@ The two changes reduce:
 
 The GPU speedup is smaller than the FLOP reduction: at batch 1 this decode is bandwidth-bound, and the
 exact top-k selections cost real time, so 30% fewer FLOPs is ~16% less wall clock on the L4. On CPU the
-fork is slower than dense: ggml's int8 matvec already runs at the part's limit, so reading fewer bytes
-buys nothing and the selection is pure overhead.
+fork is level with dense: the naive port measured 0.87x, because ggml's int8 matvec already runs at the
+part's limit, so reading fewer bytes buys nothing there — reusing the score pass's silu and replacing
+both nth_element selections with a radix select brought it to 1.00-1.05x across paired runs.
 
 ### Quality trade-off
 
@@ -85,9 +86,9 @@ The gate must see every unit — it is the router — but the two projections do
 Per-token cost is $d(F+c+k)$ instead of $3dF$; at `c = 5,120`, `k = 2,304` of `F = 7,680` that is
 65.6% of the dense FFN.
 
-Selection is exact, never a threshold: a four-pass radix select over the floating-point bit pattern on
-CUDA and Metal. Thresholds cannot hold a per-token count and were measured to prune far less than they
-claim.
+Selection is exact, never a threshold: a four-pass radix select over the floating-point bit pattern,
+on all three backends. Thresholds cannot hold a per-token count and were measured to prune far less
+than they claim.
 
 ### Vocabulary cut
 
