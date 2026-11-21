@@ -41,17 +41,33 @@ three.
 | --- | --- | --- | --- | --- | --- |
 | CUDA | L4, 23 GB, sm_89, CUDA 13.0 | 110.9 t/s (9.01 ms) | 123.7 (8.09) | **132.7 (7.54)** | **1.19x** |
 | Metal | Apple M5, 8 GPU cores, 147.5 GB/s measured | 66.0 t/s (15.16 ms) | 75.1 (13.32) | **80.2 (12.47)** | **1.22x** |
-| CPU | x86/ARM, ggml int8 SIMD, `-t 4` | 43.3 t/s (23.1 ms) | 42.1 (23.8) | **44.4 (22.5)** | **1.00x** |
+| CPU | x86/ARM, ggml int8 SIMD, `-t 4` | **43.9 t/s (22.8 ms)** | 36.8 (27.2) | 39.3 (25.4) | **0.90x, loses** |
 
-The CPU row took real work to reach level: the naive port measured 0.87x (dense 43.3 vs cut 39.9),
-because ggml's dense int8 matvec already streams bytes at close to what the part can do, so reading
-fewer of them buys nothing and the selection is pure overhead. Reusing the score pass's silu instead
-of a second expf per selected row and replacing both nth_element selections with the same radix select
-the other backends use brought it to 1.00-1.05x across paired interleaved runs (cut 45.3/44.4 vs
-dense 43.2/44.3). A unit-major down layout measured worse (0.847 paired) and was reverted: the
-chunk-major layout it replaced is four near-sequential 128-byte streams per thread, not the scattered
-lines it was first misread as. The GPU rows win for the opposite reason — their gathers reach
-160-210 GB/s against a ~300 GB/s array, so halving the bytes does help, just not proportionally.
+The CPU row stays below dense: the naive port measured 0.87x (dense 43.3 vs cut 39.9), because
+ggml's dense int8 matvec already streams bytes at close to what the part can do, so reading fewer of
+them buys nothing and the selection is pure overhead. Two changes were tried. Reusing the score pass's
+silu instead of a second `expf` per selected row gained ~0.03 (0.901 paired, and the `expf` was nearly
+free on this part, so the gain is bookkeeping). Replacing both `nth_element` selections with the radix
+select the other backends use is neutral on this CPU: back-to-back on the same machine, `nth_element`
+measures 73-83 us/layer and the radix 75-79, with the down op identical once both select the same
+units. The cut arm now reads 0.896 (0.852 / 0.896 / 0.905 over three paired interleaved runs, dense
+43.6-44.7 t/s).
+
+An earlier revision of the radix read 1.00-1.05x. That version discarded every bucket above the
+threshold digit at each pass, so it selected a systematically lower set: the CPU arm produced
+degenerate text at `k = 2304` while the `c = k = F` identity gate — which selects everything and
+therefore exercises no selection at all — still passed. With the descent keeping the above-threshold
+elements the selection is exact (cross-checked against `nth_element` on random data and on real
+activations via `LLAMA_CASCADE_VERIFY_SEL`, which the bench runs before it times anything), and the
+row is the 0.90 above. The lesson is in the runner: identity at full width does not validate a
+selection.
+
+A unit-major down layout measured worse (0.847 paired) and was reverted: the chunk-major layout it
+replaced is four near-sequential 128-byte streams per thread, not the scattered lines it was first
+misread as, and with a correct selection the down cost depends on which units are gathered (the
+deferred per-block scale flush), so a layout A/B must be taken against the same selection. The GPU
+rows win for the opposite reason — their gathers reach 160-210 GB/s against a ~300 GB/s array, so
+halving the bytes does help, just not proportionally.
 
 ### Where the time goes (CUDA, per token, 24 layers)
 

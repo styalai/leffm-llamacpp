@@ -14,7 +14,7 @@ Batch-1 decode, LFM3-1.7B Q8_0, `llama-bench -p 0 -n 32 -r 3`, best of five. "de
 | --- | ---: | ---: | ---: |
 | CUDA (L4) | 9.01 ms/token | **7.54 ms/token** | **1.19x** |
 | Metal (M5) | 15.16 ms/token | **12.47 ms/token** | **1.22x** |
-| CPU (M5, `-t 4`) | 22.6 ms/token | **22.5 ms/token** | **1.00x** |
+| CPU (M5, `-t 4`) | **22.8 ms/token** | 25.4 ms/token | 0.90x |
 
 The two changes reduce:
 
@@ -23,9 +23,15 @@ The two changes reduce:
 
 The GPU speedup is smaller than the FLOP reduction: at batch 1 this decode is bandwidth-bound, and the
 exact top-k selections cost real time, so 30% fewer FLOPs is ~16% less wall clock on the L4. On CPU the
-fork is level with dense: the naive port measured 0.87x, because ggml's int8 matvec already runs at the
-part's limit, so reading fewer bytes buys nothing there — reusing the score pass's silu and replacing
-both nth_element selections with a radix select brought it to 1.00-1.05x across paired runs.
+fork stays below dense: the naive port measured 0.87x, because ggml's int8 matvec already runs at the
+part's limit, so reading fewer bytes buys nothing there. Reusing the score pass's silu instead of a
+second expf per selected row gained ~0.03 (0.875 -> 0.901 paired). Replacing both `nth_element`
+selections with a radix select measured neutral (`nth_element` ~77 us/layer, radix ~77): an earlier
+version of it read 1.00-1.05x because it discarded every bucket above the selection threshold, which
+selects the wrong units and still passes the `c = k = F` identity gate — the CPU arm produced
+degenerate text at `k = 2304` while that gate passed. With the selection made exact the same node
+measures 0.896 (0.852 / 0.896 / 0.905 over three paired runs), and the bench now cross-checks the
+selection against `nth_element` at the operating point before timing anything.
 
 ### Quality trade-off
 
@@ -110,7 +116,9 @@ The cascade applies to single-token steps only (`T = 1`); prompt processing take
 
 ## Tested / not tested
 
-- **Tested**: greedy-identity at `c = k = F` on CUDA, Metal and CPU; every kernel variant listed in
+- **Tested**: greedy-identity at `c = k = F` on CUDA, Metal and CPU; the radix selection cross-checked
+  against `nth_element` (randomized trials, plus real activations through `LLAMA_CASCADE_VERIFY_SEL`,
+  which the CPU bench runner runs at `c=5120, k=2304` before it times anything); every kernel variant listed in
   [docs/lfm3-cascade.md](docs/lfm3-cascade.md) (radix vs bisection, load widths, occupancy shapes,
   slice counts, and a fused selection+gather+reduction that measured slower and was reverted);
   per-dispatch cost, measured by repeating an idempotent selection.
