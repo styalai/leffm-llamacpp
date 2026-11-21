@@ -21,7 +21,6 @@
 #define CASCADE_DOWN_SLICES 32
 #define CASCADE_DOWN_BLOCK  512   // threads per block: 512*4 outputs covers D in one step
 #define CASCADE_DOWN_SEL_BLOCK 512   // block size of the selection fused into CASCADE_DOWN
-#define CASCADE_DOWN_SHMEM_MAX  (96*1024)   // scores + selected list, opted in below
 
 // exact top-`target` of a non-negative score array, compacted into an ascending list of unit ids.
 // thread t owns the contiguous slice [t*per, (t+1)*per) so a scan of per-thread counts yields an
@@ -671,14 +670,23 @@ void ggml_cuda_op_cascade_down(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     // the scores and the selected list share one buffer of (nin + k) floats, which for the identity
     // configuration (c = k = F) is 60 KB: past the 48 KB default, so raise the block limit once
     const size_t shmem = (size_t) (nin + k) * sizeof(float);
-    GGML_ASSERT(shmem <= CASCADE_DOWN_SHMEM_MAX);
     {
-        static bool attr_set = false;
-        if (!attr_set) {
-            attr_set = true;
+        // raise the dynamic shared limit only as far as this launch needs: asking for more than the
+        // device allows (minus the kernel's static shared) fails with "invalid argument"
+        static int raised = 0;
+        if ((int) shmem > raised) {
+            int maxopt = 0;
+            CUDA_CHECK(cudaDeviceGetAttribute(&maxopt, cudaDevAttrMaxSharedMemoryPerBlockOptin,
+                                              ggml_cuda_get_device()));
+            if ((int) shmem > maxopt) {
+                GGML_ABORT("%s: the fused down op needs %zu bytes of dynamic shared memory, "
+                           "the device allows at most %d", __func__, shmem, maxopt);
+            }
             CUDA_CHECK(cudaFuncSetAttribute(cascade_down_fused_kernel,
-                                             cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                             CASCADE_DOWN_SHMEM_MAX));
+                                             cudaFuncAttributeMaxDynamicSharedMemorySize, (int) shmem));
+            fprintf(stderr, "%s: dynamic shared raised to %zu bytes (device allows %d)\n",
+                    __func__, shmem, maxopt);
+            raised = (int) shmem;
         }
     }
     g_ct.start(ctx.stream());
