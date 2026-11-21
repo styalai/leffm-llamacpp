@@ -70,7 +70,7 @@ A converted cascade checkpoint carries its operating point in the GGUF (`lfm3.ca
 is disabled by the file itself:
 
 ```sh
-./build/bin/llama-cli -m lfm3-1.7b-cascade-30-Q8_0.gguf -p "The quick brown fox" -n 32
+./build/bin/llama-cli -m leffm-1.7b-Q8_0.gguf -p "The quick brown fox" -n 32
 ```
 
 Such a model is already vocabulary-cut and its tokenizer lives in the GGUF, so `LLAMA_CASCADE_VOCAB`

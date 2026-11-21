@@ -157,7 +157,7 @@ cmake --build build -j --target llama-cli llama-bench
 cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j --target llama-cli
 
 # a converted cascade checkpoint: operating point in the GGUF, repack disabled by the file itself
-./build/bin/llama-cli -m lfm3-1.7b-cascade-30-Q8_0.gguf -p "..." -n 32
+./build/bin/llama-cli -m leffm-1.7b-Q8_0.gguf -p "..." -n 32
 
 # the stock 128k model: dense baseline, then the cascade, then the cascade with the id cut
 ./build/bin/llama-cli -m LFM3-1.7B-Q8_0.gguf -p "..." -n 32 --no-repack
