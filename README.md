@@ -61,12 +61,11 @@ Copy-paste, CUDA first, Metal second.
 ```sh
 # NVIDIA GPU: FlashAttention is built in, and `native` compiles for the local GPU
 git clone https://github.com/styalai/leffm-llamacpp && cd leffm-llamacpp
-cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=native \
-      -DLLAMA_CURL=OFF -DCMAKE_BUILD_TYPE=Release
+cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=native -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j --target llama-cli llama-bench
 
 # Apple silicon (Metal is the default there) or CPU
-cmake -B build -DLLAMA_CURL=OFF -DCMAKE_BUILD_TYPE=Release
+cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j --target llama-cli llama-bench
 
 hf download LiquidAI/LFM3-1.7B-GGUF LFM3-1.7B-Q8_0.gguf --local-dir .
