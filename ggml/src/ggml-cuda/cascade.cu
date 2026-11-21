@@ -55,11 +55,9 @@ __global__ void cascade_sel_kernel(
         if (t < nin) {
             if (STAGE0) {
                 const float gv = g[t];
-                // __expf: the score only ranks candidates, and the accurate expf costs ~25 us per
-                // layer here, which was the largest single item of a selection
-                s[t] = fabsf(gv / (1.0f + __expf(-gv)));
+                s[i*nt + tid] = fabsf(gv / (1.0f + __expf(-gv)));
             } else {
-                s[t] = fabsf(act[min(max((int) list_in[t], 0), F - 1)]);
+                s[i*nt + tid] = fabsf(act[min(max((int) list_in[t], 0), F - 1)]);
             }
         }
     }
@@ -82,7 +80,7 @@ __global__ void cascade_sel_kernel(
         for (int i = 0; i < per; ++i) {
             const int t = tid*per + i;
             if (t < nin) {
-                const unsigned bits = __float_as_uint(s[t]);
+                const unsigned bits = __float_as_uint(s[i*nt + tid]);
                 if ((bits & above) == want) {
                     atomicAdd(&hist[(bits >> sh) & 0xFF], 1);
                 }
@@ -139,7 +137,7 @@ __global__ void cascade_sel_kernel(
     int cnt = 0;
     for (int i = 0; i < per; ++i) {
         const int t = tid*per + i;
-        if (t < nin && __float_as_uint(s[t]) >= thr) {
+        if (t < nin && __float_as_uint(s[i*nt + tid]) >= thr) {
             ++cnt;
         }
     }
@@ -154,7 +152,7 @@ __global__ void cascade_sel_kernel(
     int pos = scan[tid] - cnt;
     for (int i = 0; i < per; ++i) {
         const int t = tid*per + i;
-        if (t < nin && __float_as_uint(s[t]) >= thr && pos < target) {
+        if (t < nin && __float_as_uint(s[i*nt + tid]) >= thr && pos < target) {
             list_out[pos++] = STAGE0 ? (float) t : list_in[t];
         }
     }
