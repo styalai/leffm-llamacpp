@@ -14,7 +14,8 @@
 // are small enough for the scores to live in shared memory.
 
 #define CASCADE_SEL_BLOCK 1024
-#define CASCADE_SEL_MAX   8192   // scores held in shared memory (32 KB)
+#define CASCADE_SEL_MAX   8192   // largest score array, i.e. per <= 8 for 1024 threads
+#define CASCADE_SEL_PERMAX 8     // scores per thread, held in registers
 #define CASCADE_UP_BLOCK  128   // four warps, one candidate each
 #define CASCADE_UP_WARPS   4
 #define CASCADE_DOWN_SLICES 32
@@ -40,42 +41,34 @@ __global__ void cascade_sel_kernel(
         const int nin,
         const int target,
         const int npass) {
-    extern __shared__ float s[];              // nin scores
+    // Scores live in registers, like the Metal kernel, not in 32 KB of dynamic shared memory: that
+    // allocation asks the driver to reconfigure the SM carveout on every launch, 48 times per token,
+    // and is the only cost the phase bisect could not attribute to anything else.
+    float s[CASCADE_SEL_PERMAX];
     __shared__ int hist[256];
     __shared__ int scan[CASCADE_SEL_BLOCK];
     __shared__ int sel_digit, sel_need;
     const int tid = threadIdx.x;
     const int nt  = blockDim.x;
-    const int per = (nin + nt - 1) / nt;
+    const int per  = (nin + nt - 1) / nt;
+    const int base = tid*per;
 
-    // the block covers nt*per >= nin slots and only [0, nin) exists in shared memory: the padding
-    // must not be written (every later read is guarded by t < nin)
-    if (STAGE0 && per == 8) {
-        // One block reads the whole score array, so the fetch is latency-bound: eight scalar loads
-        // per thread leave about a kilobyte in flight, which costs ~25 us per layer. Two 16-byte
-        // loads per thread cut the requests fourfold and keep a warp's accesses contiguous.
-        float4 a0, a1;
-        const int  base = tid*per;
-        if (base + 8 <= nin) {
-            a0 = *(const float4 *) (g + base);
-            a1 = *(const float4 *) (g + base + 4);
-        } else {
-            a0 = a1 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-        }
+    if (STAGE0 && per == CASCADE_SEL_PERMAX && base + CASCADE_SEL_PERMAX <= nin) {
+        // two 16-byte loads keep the fetch of this thread's slice contiguous
+        const float4 a0 = *(const float4 *) (g + base);
+        const float4 a1 = *(const float4 *) (g + base + 4);
         const float v[8] = { a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w };
         #pragma unroll
-        for (int i = 0; i < 8; ++i) {
-            const int t = base + i;
-            if (t < nin) {
-                const float gv = v[i];
-                s[i*nt + tid] = fabsf(gv / (1.0f + __expf(-gv)));
-            }
+        for (int i = 0; i < CASCADE_SEL_PERMAX; ++i) {
+            const float gv = v[i];
+            s[i] = fabsf(gv / (1.0f + __expf(-gv)));
         }
     } else {
         for (int i = 0; i < per; ++i) {
-            const int t = tid*per + i;
+            const int t = base + i;
             if (t < nin) {
-                s[i*nt + tid] = fabsf(act[min(max((int) list_in[t], 0), F - 1)]);
+                s[i] = STAGE0 ? fabsf(g[t] / (1.0f + __expf(-g[t])))
+                              : fabsf(act[min(max((int) list_in[t], 0), F - 1)]);
             }
         }
     }
@@ -98,7 +91,7 @@ __global__ void cascade_sel_kernel(
         for (int i = 0; i < per; ++i) {
             const int t = tid*per + i;
             if (t < nin) {
-                const unsigned bits = __float_as_uint(s[i*nt + tid]);
+                const unsigned bits = __float_as_uint(s[i]);
                 if ((bits & above) == want) {
                     atomicAdd(&hist[(bits >> sh) & 0xFF], 1);
                 }
@@ -155,7 +148,7 @@ __global__ void cascade_sel_kernel(
     int cnt = 0;
     for (int i = 0; i < per; ++i) {
         const int t = tid*per + i;
-        if (t < nin && __float_as_uint(s[i*nt + tid]) >= thr) {
+        if (t < nin && __float_as_uint(s[i]) >= thr) {
             ++cnt;
         }
     }
@@ -170,7 +163,7 @@ __global__ void cascade_sel_kernel(
     int pos = scan[tid] - cnt;
     for (int i = 0; i < per; ++i) {
         const int t = tid*per + i;
-        if (t < nin && __float_as_uint(s[i*nt + tid]) >= thr && pos < target) {
+        if (t < nin && __float_as_uint(s[i]) >= thr && pos < target) {
             list_out[pos++] = STAGE0 ? (float) t : list_in[t];
         }
     }
@@ -449,15 +442,19 @@ void ggml_cuda_op_cascade_up(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
     float * lsk = sel + 2*F;                  // row 2 (stage-1 list)
 
     cudaStream_t st = ctx.stream();
-    // the scores live in a strided layout (s[i*nt + tid]) and address the full nt*per slots, which is
-    // at least nin, so the buffer is sized by slots and not by nin
-    const int per0  = (F + CASCADE_SEL_BLOCK - 1)/CASCADE_SEL_BLOCK;
-    const int shmem = (int) (per0*CASCADE_SEL_BLOCK*sizeof(float));
+    const int shmem = 0;      // the scores are in registers
 
     g_ct.start(st);
     if (!cascade_skip("sel0"))
     cascade_sel_kernel<true><<<1, CASCADE_SEL_BLOCK, shmem, st>>>(
         (const float *) g->data, act, lsk, lst, F, c, F, c, sel_npass());
+    {   // CASCADE_CUDA_EXTRA_DISP: repeat this idempotent dispatch to price one dispatch
+        static const int extra = getenv("CASCADE_CUDA_EXTRA_DISP") ? atoi(getenv("CASCADE_CUDA_EXTRA_DISP")) : 0;
+        for (int r = 0; r < extra; ++r) {
+            cascade_sel_kernel<true><<<1, CASCADE_SEL_BLOCK, shmem, st>>>(
+                (const float *) g->data, act, lsk, lst, F, c, F, c, sel_npass());
+        }
+    }
     g_ct.stop(st, g_ct.sel0, g_ct.n_sel0);
     CUDA_CHECK(cudaGetLastError());
 
@@ -471,8 +468,7 @@ void ggml_cuda_op_cascade_up(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
 
     g_ct.start(st);
     if (!cascade_skip("sel1")) {
-        const int per1 = (c + CASCADE_SEL_BLOCK - 1)/CASCADE_SEL_BLOCK;
-        cascade_sel_kernel<false><<<1, CASCADE_SEL_BLOCK, (int) (per1*CASCADE_SEL_BLOCK*sizeof(float)), st>>>(
+            cascade_sel_kernel<false><<<1, CASCADE_SEL_BLOCK, 0, st>>>(
             (const float *) g->data, act, lst, lsk, F, c, c, k, sel_npass());
     }
     g_ct.stop(st, g_ct.sel1, g_ct.n_sel1);
