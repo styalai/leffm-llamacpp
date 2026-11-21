@@ -1,96 +1,87 @@
-# llama.cpp
+# leffm-llamacpp
 
-> Research fork of [llama.cpp](https://github.com/ggml-org/llama.cpp), branched at `7fce543`. One
-> experiment: a sparse LFM3 FFN plus a vocabulary cut. Nothing here is proposed for upstream.
+A research fork of [llama.cpp](https://github.com/ggml-org/llama.cpp), branched at `7fce543`.
 
-## Performance
+This fork explores two inference optimizations for **LFM3-1.7B**:
 
-LFM3-1.7B Q8_0, batch-1 decode, `llama-bench -p 0 -n 32 -r 3`, best of five. "basic" is stock dense
-llama.cpp, "leffm" is this fork with the cascade and the vocabulary cut.
+- A sparse, two-stage FFN cascade.
+- A reduced vocabulary head.
 
-| backend | basic | leffm | speedup |
-| --- | --- | --- | --- |
-| CUDA | 9.01 ms/token | **7.54 ms/token** | **1.19x** |
-| Metal | 15.16 ms/token | **12.47 ms/token** | **1.22x** |
-| CPU | 23.1 ms/token | 25.1 ms/token | 0.87x |
+The goal is to measure the real inference speedup, not just the reduction in FLOPs. This is an isolated experiment, not a proposal for upstream llama.cpp.
 
-Hardware tested, and nothing else: CUDA on a single NVIDIA L4 (23 GB, compute capability 8.9, CUDA 13.0)
-on a Colab VM; Metal on an Apple M5 (8 GPU cores, 147.5 GB/s measured streaming peak); CPU on the same
-M5's x86/ARM int8 kernels at `-t 4`. No A100/H100, no other Apple silicon, no measurement at batch
-sizes above one.
+## Results
 
-**-30.0% FLOPs/token** (FFN at 65.6% of dense, head at 52.4%) and **-7.4% parameters**. On GPUs that is
-1.19-1.22x wall clock; on CPU it is a slowdown, because there ggml's dense int8 matvec already runs at
-the part's limit while a GPU gather does not — which is also why 30% fewer FLOPs is ~16% less time on an
-L4 rather than 30%.
+**Batch-1 decode, Q8_0, `llama-bench -p 0 -n 32 -r 3`.** Best result across five runs.
 
-Quality: **+6.8% bits/byte** after a matched 2.67M-token continued-pretraining run (one corpus,
-perplexity only), +0.082 nats zero-shot. At `LLAMA_CASCADE=7680,7680` the cascade reproduces dense greedy
-output exactly.
+| Backend | Dense llama.cpp | leffm | Speedup |
+|---|---:|---:|---:|
+| CUDA (L4) | 9.01 ms/token | **7.54 ms/token** | **1.19×** |
+| Metal (M5) | 15.16 ms/token | **12.47 ms/token** | **1.22×** |
+| CPU (M5) | 23.1 ms/token | 25.1 ms/token | 0.87× |
 
-## Usage
+The changes reduce:
 
-Copy-paste; on macOS drop the `GGML_CUDA` flags and it builds Metal instead.
+- **30.0% of FLOPs per token** — the FFN costs 65.6% of its dense equivalent, and the output head 52.4%.
+- **7.4% of model parameters** through the vocabulary cut.
 
-```sh
-git clone https://github.com/styalai/leffm-llamacpp && cd leffm-llamacpp
-cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=89 -DGGML_CUDA_FA=OFF \
-      -DLLAMA_CURL=OFF -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j --target llama-cli llama-bench
+The GPU speedup is smaller than the FLOP reduction: 30% fewer FLOPs translates to roughly 16% less decode time on the L4. On CPU, the result is actually slower. The dense int8 matvec kernels are already highly optimized, while the sparse gather operations add overhead.
 
-hf download LiquidAI/LFM3-1.7B-GGUF LFM3-1.7B-Q8_0.gguf --local-dir .
-```
+### Quality trade-off
 
-Run leffm (cascade 5120/2304 + vocabulary cut):
+After a matched continued-pretraining run on a single corpus (2.67M tokens), the modified model measured:
 
-```sh
-LLAMA_CASCADE=5120,2304 LLAMA_CASCADE_VOCAB=docs/lfm3-trim-ids.txt \
-  ./build/bin/llama-cli -m LFM3-1.7B-Q8_0.gguf -p "The quick brown fox" -n 32 --no-repack
-```
+- **+6.8% bits/byte**.
+- **+0.082 nats** in zero-shot evaluation.
 
-Benchmark it:
+Evaluation was limited to perplexity and this zero-shot metric; no broader benchmark suite was run.
 
-```sh
-LLAMA_CASCADE=5120,2304 LLAMA_CASCADE_VOCAB=docs/lfm3-trim-ids.txt \
-  ./build/bin/llama-bench -m LFM3-1.7B-Q8_0.gguf -p 0 -n 32 -r 3 -ngl 999 --no-warmup
-```
+At `LLAMA_CASCADE=7680,7680`, the cascade reproduces dense greedy output exactly.
 
-`docs/lfm3-trim-ids.txt` is the 65,536-id set the numbers above were measured with. The head and tied
-embedding are trimmed **at load time** from the stock 128k weights, so no custom model file is needed.
-`--no-repack` and Q8_0 weights are required. Omit `LLAMA_CASCADE` for the stock dense model, or
-`LLAMA_CASCADE_VOCAB` for the cascade without the cut.
+### Hardware and benchmark scope
+
+Only these configurations were tested:
+
+| Backend | Hardware |
+|---|---|
+| CUDA | NVIDIA L4, 23 GB, compute capability 8.9, CUDA 13.0, Colab VM |
+| Metal | Apple M5, 8 GPU cores, 147.5 GB/s measured streaming peak |
+| CPU | Apple M5, ARM int8 kernels, `-t 4` |
+
+No A100/H100, other Apple silicon, or batch sizes above one were tested. All CUDA benchmarks ran with FlashAttention disabled.
 
 ## How it works
-## How it works
 
-A gated FFN does `silu(x·W_gateᵀ) ⊙ (x·W_upᵀ) · W_down`. The gate must see every unit — it is the
-router — but the projections need not:
+A gated FFN computes:
 
-1. score all `F` units by `|silu(g)|`, keep the top `c` **exactly**;
-2. run the up projection for those `c` units only;
-3. rescore by the true activation `|silu(g)·u|`, keep the top `k` exactly;
-4. run the down projection for those `k` units only.
+\[
+\operatorname{FFN}(x)
+=
+\left(\operatorname{SiLU}(xW_{\text{gate}}^T)
+\odot xW_{\text{up}}^T\right)W_{\text{down}}
+\]
 
-Cost per token is `d·(F + c + k)` instead of `3·d·F`. Selection is exact on every backend (four-pass
-radix select on the float bit pattern on CUDA and Metal), not a threshold: thresholds cannot hold a
-per-token count and were measured to prune far less than they claim. The vocabulary cut trims the tied
-head, and `CASCADE_EXPAND` scatters the trimmed logits back into the full vocabulary so sampling code is
-untouched. It applies to single-token steps only; prompts take the dense path.
+The gate determines which units matter, but the two other projections do not necessarily need to process every unit.
 
-Build details, per-backend internals and every diagnostic knob:
-**[docs/lfm3-cascade.md](docs/lfm3-cascade.md)**.
+The cascade uses two selection stages:
 
-### What was and was not tested
+1. Compute the gate for all \(F\) units and select the top \(c\) using \(|\operatorname{SiLU}(g)|\).
+2. Compute the up projection only for those \(c\) units.
+3. Rescore using the actual activation magnitude, \(|\operatorname{SiLU}(g)\cdot u|\), and select the top \(k\).
+4. Compute the down projection only for those \(k\) units.
 
-- Tested: greedy-identity at `c = k = F` on CUDA, Metal and CPU; every kernel variant in the docs
-  (radix vs bisection, load widths, occupancy shapes, slice counts, and a fused
-  selection+gather+reduction that measured slower and was reverted); per-dispatch cost.
-- Not tested: any GPU but an L4 (no A100/H100), FlashAttention **off** in every CUDA benchmark, batch 1
-  only, Metal on anything but an 8-core M5, quality beyond perplexity on one corpus.
+The approximate per-token cost becomes:
 
-The llama.cpp part is MIT as upstream; model weights produced with it are derivatives of
-[LiquidAI/LFM3-1.7B](https://huggingface.co/LiquidAI/LFM3-1.7B) and carry that model's licence.
+\[
+d(F+c+k)
+\quad\text{instead of}\quad
+3dF
+\]
 
+Selection is exact, with a fixed number of selected units per token. CUDA and Metal use a four-pass radix selection on the floating-point bit representation. Threshold-based pruning was avoided because it cannot guarantee a fixed per-token count and pruned considerably less than expected in testing.
+
+### Vocabulary cut
+
+The vocabulary head and tied embedding are trimmed at load time from the
 ![llama.cpp](https://raw.githubusercontent.com/ggml-org/llama-brand/refs/heads/master/logo/svg/cover/llama-cpp/cover-llama-cpp-dark.svg)
 
 <div align="center">
