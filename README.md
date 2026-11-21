@@ -41,31 +41,26 @@ cmake --build build -j --target llama-cli llama-bench
 hf download LiquidAI/LFM3-1.7B-GGUF LFM3-1.7B-Q8_0.gguf --local-dir .
 ```
 
-Dense, then the cascade, then the cascade with the vocabulary cut:
+Run leffm (cascade 5120/2304 + vocabulary cut):
 
 ```sh
-./build/bin/llama-cli -m LFM3-1.7B-Q8_0.gguf -p "The quick brown fox" -n 32 --no-repack
-
-LLAMA_CASCADE=5120,2304 \
-  ./build/bin/llama-cli -m LFM3-1.7B-Q8_0.gguf -p "The quick brown fox" -n 32 --no-repack
-
 LLAMA_CASCADE=5120,2304 LLAMA_CASCADE_VOCAB=docs/lfm3-trim-ids.txt \
   ./build/bin/llama-cli -m LFM3-1.7B-Q8_0.gguf -p "The quick brown fox" -n 32 --no-repack
 ```
 
-Same three arms as a benchmark:
+Benchmark it:
 
 ```sh
-for env in "" "LLAMA_CASCADE=5120,2304" \
-           "LLAMA_CASCADE=5120,2304 LLAMA_CASCADE_VOCAB=docs/lfm3-trim-ids.txt"; do
-  env $env ./build/bin/llama-bench -m LFM3-1.7B-Q8_0.gguf -p 0 -n 32 -r 3 -ngl 999 --no-warmup
-done
+LLAMA_CASCADE=5120,2304 LLAMA_CASCADE_VOCAB=docs/lfm3-trim-ids.txt \
+  ./build/bin/llama-bench -m LFM3-1.7B-Q8_0.gguf -p 0 -n 32 -r 3 -ngl 999 --no-warmup
 ```
 
 `docs/lfm3-trim-ids.txt` is the 65,536-id set the numbers above were measured with. The head and tied
 embedding are trimmed **at load time** from the stock 128k weights, so no custom model file is needed.
-`--no-repack` is required, and Q8_0 weights are required for the cascade.
+`--no-repack` and Q8_0 weights are required. Omit `LLAMA_CASCADE` for the stock dense model, or
+`LLAMA_CASCADE_VOCAB` for the cascade without the cut.
 
+## How it works
 ## How it works
 
 A gated FFN does `silu(x·W_gateᵀ) ⊙ (x·W_upᵀ) · W_down`. The gate must see every unit — it is the
