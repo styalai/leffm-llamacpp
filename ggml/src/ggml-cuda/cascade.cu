@@ -673,6 +673,12 @@ void ggml_cuda_op_cascade_down(ggml_backend_cuda_context & ctx, ggml_tensor * ds
         (float *) sp->data, (float *) dst->data, counter,
         D, F, nin, k, S);
     g_ct.stop(ctx.stream(), g_ct.down, g_ct.n_down);
+    if (g_ct.on && g_ct.n_down % 24 == 0) {
+        g_ct.dump();
+        if (g_ct.n_up >= 48) {
+            g_ct.on = false;    // stop before graph capture, which cannot contain a blocking sync
+        }
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 
