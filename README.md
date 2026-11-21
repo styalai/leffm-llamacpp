@@ -43,13 +43,12 @@ continued-pretraining run of 2.67M tokens — dense and leffm trained for the sa
 
 | arm | PPL/token | bits/byte |
 | --- | ---: | ---: |
-| stock LFM3-1.7B, no training | 3.392 | 0.4270 |
+| stock LFM3-1.7B | 3.392 | 0.4270 |
 | dense, after CPT | **2.832** | **0.3639** |
-| leffm, no training | 3.684 | 0.4563 |
-| leffm, after CPT | **3.035** | **0.3885** |
+| leffm | **3.035** | **0.3885** |
 
-Against the dense model at matched training, leffm costs **+0.069 nats (+6.8% bits/byte)**; zero-shot,
-before any training, **+0.082 nats**. The two tokenizations differ slightly (the cut tokenizer needs
+Against the dense model at matched training, leffm costs **+0.069 nats (+6.8% bits/byte)**. The two
+tokenizations differ slightly (the cut tokenizer needs
 1.004x as many tokens for the same text), so bits/byte is the comparable column. No benchmark suite
 beyond perplexity was run — treat these as the price on this corpus, not as a general statement.
 At `LLAMA_CASCADE=7680,7680` the cascade reproduces dense greedy output exactly, which is the check
