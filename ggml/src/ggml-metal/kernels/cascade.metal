@@ -146,10 +146,12 @@ kernel void kernel_cascade_down_reduce(
     y[o] = s;
 }
 
-// Exact top-c / top-k selection in a single threadgroup: positive floats are monotone in their bit
-// pattern, so 32 halvings over [bits(min), bits(max)] find the exact n-th largest value. Scores live
-// in registers; every pass reduces a count across the threadgroup (simdgroup sums + one shared
-// reduction), so no atomics and no grid-wide sync are needed.
+// Exact top-c / top-k selection in a single threadgroup. Positive floats are monotone in their bit
+// pattern, so four 8-bit radix passes over the score bits find the exact n-th largest value: four
+// scans of the scores instead of 32 halvings. Each pass fills a 256-bin threadgroup histogram, picks
+// the digit that holds the rank still sought (smallest d whose count above is below that rank) and
+// resolves the next eight bits of the threshold. Scores live in registers; the compaction is the same
+// per-thread/lane prefix walk that produced the ascending list before.
 kernel void kernel_cascade_sel(
         constant ggml_metal_kargs_cascade_sel & args,
         device const float * g,        // [F] gate pre-activations (stage 0 scores)
@@ -160,8 +162,6 @@ kernel void kernel_cascade_sel(
         uint ntg[[threads_per_threadgroup]]) {
     const int  F   = args.F;
     const bool st0 = (args.stage == 0);
-    // the candidate list is compact, so both stages score exactly the entries they must inspect:
-    // F for the first, c for the second
     const int  nin = args.nin;
     const int  per = (nin + (int) ntg - 1) / (int) ntg;
 
@@ -185,64 +185,75 @@ kernel void kernel_cascade_sel(
         }
     }
 
-    threadgroup int tl[64];
-    threadgroup int th[64];
+    threadgroup atomic_uint hist[256];
+    threadgroup uint        suf[256];
+    threadgroup atomic_uint sel_d;    // digit chosen by the current pass
+    threadgroup uint        sel_g;    // ... broadcast to the whole threadgroup
+    threadgroup int         sel_n;    // rank that stays to be resolved inside that digit
 
-    const uint lane = tpitg % 32;
-    const uint wid  = tpitg / 32;
-    const uint nw   = ((uint) ntg + 31) / 32;
+    uint prefix = 0u;                 // bits of the threshold resolved so far
+    int  need   = args.target;        // rank still sought inside the resolved prefix
 
-    int lo = 0x7fffffff, hi = 0;
-    for (int i = 0; i < per; ++i) {
-        const int b = as_type<int>(s[i]);
-        lo = min(lo, b);
-        hi = max(hi, b);
-    }
-    lo = simd_min(lo);
-    hi = simd_max(hi);
-    if (lane == 0) { tl[wid] = lo; th[wid] = hi; }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tpitg == 0) {
-        int a = 0x7fffffff, b = 0;
-        for (uint w = 0; w < nw; ++w) { a = min(a, tl[w]); b = max(b, th[w]); }
-        tl[0] = a; th[0] = b;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    lo = tl[0]; hi = th[0];
-
-    for (int it = 0; it < 32; ++it) {
-        const int   mid = lo + (hi - lo + 1)/2;
-        const float t   = as_type<float>(mid);
-        int cnt = 0;
-        for (int i = 0; i < per; ++i) {
-            cnt += (s[i] >= t) ? 1 : 0;
+    for (int sh = 24; sh >= 0; sh -= 8) {
+        if (tpitg < 256) {
+            atomic_store_explicit(&hist[tpitg], 0u, memory_order_relaxed);
         }
-        cnt = simd_sum(cnt);
-        if (lane == 0) { tl[wid] = cnt; }
+        if (tpitg == 0) {
+            atomic_store_explicit(&sel_d, 255u, memory_order_relaxed);   // 255 always qualifies
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const uint above_mask = (sh == 24) ? 0u : (0xFFFFFFFFu << (sh + 8));
+        const uint want       = prefix & above_mask;
+        for (int i = 0; i < per; ++i) {
+            const uint bits = as_type<uint>(s[i]);
+            if ((bits & above_mask) == want) {
+                atomic_fetch_add_explicit(&hist[(bits >> sh) & 0xFF], 1u, memory_order_relaxed);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (tpitg < 256) {
+            suf[tpitg] = atomic_load_explicit(&hist[tpitg], memory_order_relaxed);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int off = 1; off < 256; off <<= 1) {          // inclusive suffix sum over the bins
+            const uint v = (tpitg < 256 && (int) tpitg + off < 256) ? suf[tpitg + off] : 0u;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (tpitg < 256) {
+                suf[tpitg] += v;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (tpitg < 256) {
+            const uint above = suf[tpitg] - atomic_load_explicit(&hist[tpitg], memory_order_relaxed);
+            if (above < (uint) need) {
+                atomic_fetch_min_explicit(&sel_d, tpitg, memory_order_relaxed);
+            }
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (tpitg == 0) {
-            int tot = 0;
-            for (uint w = 0; w < nw; ++w) { tot += tl[w]; }
-            tl[0] = tot;
+            const uint d     = atomic_load_explicit(&sel_d, memory_order_relaxed);
+            const uint above = suf[d] - atomic_load_explicit(&hist[d], memory_order_relaxed);
+            sel_g = d;
+            sel_n = need - (int) above;
+            atomic_store_explicit(&sel_d, 255u, memory_order_relaxed);   // reset for the next pass
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        const int tot = tl[0];
-        if (tot >= args.target) { lo = mid; } else { hi = mid - 1; }
-        if (tpitg == 0) { tl[1] = lo; th[1] = hi; }
+        prefix |= sel_g << sh;
+        need    = sel_n;
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        lo = tl[1]; hi = th[1];
     }
 
-    const float thr = as_type<float>(lo);
-
-    // compaction: per-thread counts, simdgroup prefix, one small threadgroup scan, then an
-    // ascending write
+    // compaction: per-thread counts, simdgroup prefix, one small threadgroup scan, then an ascending
+    // write of exactly `target` ids
     int cnt = 0;
     for (int i = 0; i < per; ++i) {
-        cnt += (s[i] >= thr && s[i] > 0.0f) ? 1 : 0;
+        cnt += (as_type<uint>(s[i]) >= prefix) ? 1 : 0;
     }
     const int inclusive = simd_prefix_inclusive_sum(cnt);
     threadgroup int wsum[16];
+    const uint lane = tpitg % 32;
     const uint wid2 = tpitg / 32;
     const uint nw2  = (ntg + 31) / 32;
     if (lane == 31) {
@@ -260,7 +271,7 @@ kernel void kernel_cascade_sel(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     int pos = wsum[wid2] + inclusive - cnt;
     for (int i = 0; i < per; ++i) {
-        if (s[i] >= thr && s[i] > 0.0f) {
+        if (as_type<uint>(s[i]) >= prefix && pos < args.target) {
             list_out[pos++] = (float) js[i];
         }
     }
