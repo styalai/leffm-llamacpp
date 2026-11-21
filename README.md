@@ -1,185 +1,129 @@
 # leffm-llamacpp
 
-A research fork of [llama.cpp](https://github.com/ggml-org/llama.cpp), branched at `7fce543`.
-
-This fork explores two inference optimizations for **LFM3-1.7B**:
-
-- A sparse, two-stage FFN cascade.
-- A reduced vocabulary head.
-
-The goal is to measure the real inference speedup, not just the reduction in FLOPs. This is an isolated experiment, not a proposal for upstream llama.cpp.
+A research fork of [llama.cpp](https://github.com/ggml-org/llama.cpp), branched at `7fce543`, that runs
+LFM3-1.7B with a sparse two-stage FFN cascade and a cut vocabulary. Everything else is upstream
+llama.cpp, unmodified, and nothing here is proposed for upstream. The goal was to measure what a
+-30% FLOPs model actually buys in wall clock, not just on paper.
 
 ## Results
 
-**Batch-1 decode, Q8_0, `llama-bench -p 0 -n 32 -r 3`.** Best result across five runs.
+Batch-1 decode, LFM3-1.7B Q8_0, `llama-bench -p 0 -n 32 -r 3`, best of five. "dense" is stock llama.cpp,
+"leffm" is this fork with the cascade and the vocabulary cut.
 
-| Backend | Dense llama.cpp | leffm | Speedup |
-|---|---:|---:|---:|
-| CUDA (L4) | 9.01 ms/token | **7.54 ms/token** | **1.19×** |
-| Metal (M5) | 15.16 ms/token | **12.47 ms/token** | **1.22×** |
-| CPU (M5) | 23.1 ms/token | 25.1 ms/token | 0.87× |
+| backend | dense | leffm | speedup |
+| --- | ---: | ---: | ---: |
+| CUDA (L4) | 9.01 ms/token | **7.54 ms/token** | **1.19x** |
+| Metal (M5) | 15.16 ms/token | **12.47 ms/token** | **1.22x** |
+| CPU (M5, `-t 4`) | 23.1 ms/token | 25.1 ms/token | 0.87x |
 
-The changes reduce:
+The two changes reduce:
 
-- **30.0% of FLOPs per token** — the FFN costs 65.6% of its dense equivalent, and the output head 52.4%.
-- **7.4% of model parameters** through the vocabulary cut.
+- **30.0% of FLOPs per token** — the FFN costs 65.6% of its dense equivalent, the output head 52.4%;
+- **7.4% of parameters** through the vocabulary cut.
 
-The GPU speedup is smaller than the FLOP reduction: 30% fewer FLOPs translates to roughly 16% less decode time on the L4. On CPU, the result is actually slower. The dense int8 matvec kernels are already highly optimized, while the sparse gather operations add overhead.
+The GPU speedup is smaller than the FLOP reduction: at batch 1 this decode is bandwidth-bound, and the
+exact top-k selections cost real time, so 30% fewer FLOPs is ~16% less wall clock on the L4. On CPU the
+fork is slower than dense: ggml's int8 matvec already runs at the part's limit, so reading fewer bytes
+buys nothing and the selection is pure overhead.
 
 ### Quality trade-off
 
-After a matched continued-pretraining run on a single corpus (2.67M tokens), the modified model measured:
+After one matched continued-pretraining run (2.67M tokens, single corpus, perplexity only):
 
-- **+6.8% bits/byte**.
-- **+0.082 nats** in zero-shot evaluation.
+- **+6.8% bits/byte** against a dense model trained for the same number of steps;
+- **+0.082 nats** zero-shot, before any training.
 
-Evaluation was limited to perplexity and this zero-shot metric; no broader benchmark suite was run.
+No benchmark suite beyond perplexity was run, so treat these as the price on that corpus, not as a
+general statement. At `LLAMA_CASCADE=7680,7680` the cascade reproduces dense greedy output exactly,
+which is the check that everything below the selection is arithmetically the dense path.
 
-At `LLAMA_CASCADE=7680,7680`, the cascade reproduces dense greedy output exactly.
+### Hardware tested, and nothing else
 
-### Hardware and benchmark scope
-
-Only these configurations were tested:
-
-| Backend | Hardware |
-|---|---|
-| CUDA | NVIDIA L4, 23 GB, compute capability 8.9, CUDA 13.0, Colab VM |
+| backend | hardware |
+| --- | --- |
+| CUDA | NVIDIA L4, 23 GB, compute capability 8.9, CUDA 13.0, one Colab VM |
 | Metal | Apple M5, 8 GPU cores, 147.5 GB/s measured streaming peak |
-| CPU | Apple M5, ARM int8 kernels, `-t 4` |
+| CPU | the same M5's int8 kernels, `-t 4` |
 
-No A100/H100, other Apple silicon, or batch sizes above one were tested. All CUDA benchmarks ran with FlashAttention disabled.
+Not tested: any other NVIDIA part (no A100/H100), any other Apple silicon, batch sizes above one. All
+CUDA benchmarks ran with FlashAttention off, which changes nothing at 32-token contexts but means the
+absolute numbers are not the default-config ones.
+
+## Usage
+
+Copy-paste; on macOS drop the `GGML_CUDA` flags and it builds Metal instead.
+
+```sh
+git clone https://github.com/styalai/leffm-llamacpp && cd leffm-llamacpp
+cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=89 -DGGML_CUDA_FA=OFF \
+      -DLLAMA_CURL=OFF -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j --target llama-cli llama-bench
+
+hf download LiquidAI/LFM3-1.7B-GGUF LFM3-1.7B-Q8_0.gguf --local-dir .
+```
+
+Run leffm (cascade 5120/2304 + vocabulary cut):
+
+```sh
+LLAMA_CASCADE=5120,2304 LLAMA_CASCADE_VOCAB=docs/lfm3-trim-ids.txt \
+  ./build/bin/llama-cli -m LFM3-1.7B-Q8_0.gguf -p "The quick brown fox" -n 32 --no-repack
+```
+
+Benchmark it:
+
+```sh
+LLAMA_CASCADE=5120,2304 LLAMA_CASCADE_VOCAB=docs/lfm3-trim-ids.txt \
+  ./build/bin/llama-bench -m LFM3-1.7B-Q8_0.gguf -p 0 -n 32 -r 3 -ngl 999 --no-warmup
+```
+
+`docs/lfm3-trim-ids.txt` is the 65,536-id set the numbers above were measured with. The head and tied
+embedding are trimmed **at load time** from the stock 128k weights, so no custom model file is needed.
+`--no-repack` and Q8_0 weights are required. Omit `LLAMA_CASCADE` for the stock dense model, or
+`LLAMA_CASCADE_VOCAB` for the cascade without the cut.
 
 ## How it works
 
-A gated FFN computes:
+A gated FFN computes
 
-\[
-\operatorname{FFN}(x)
-=
-\left(\operatorname{SiLU}(xW_{\text{gate}}^T)
-\odot xW_{\text{up}}^T\right)W_{\text{down}}
-\]
+$$\mathrm{FFN}(x) = \big(\operatorname{SiLU}(xW_{\text{gate}}^T) \odot (xW_{\text{up}}^T)\big) W_{\text{down}}.$$
 
-The gate determines which units matter, but the two other projections do not necessarily need to process every unit.
+The gate must see every unit — it is the router — but the two projections do not:
 
-The cascade uses two selection stages:
+1. score all `F` units by `|silu(g)|`, keep the top `c` **exactly**;
+2. run the up projection for those `c` units only;
+3. rescore by the true activation `|silu(g)·u|`, keep the top `k` exactly;
+4. run the down projection for those `k` units only.
 
-1. Compute the gate for all \(F\) units and select the top \(c\) using \(|\operatorname{SiLU}(g)|\).
-2. Compute the up projection only for those \(c\) units.
-3. Rescore using the actual activation magnitude, \(|\operatorname{SiLU}(g)\cdot u|\), and select the top \(k\).
-4. Compute the down projection only for those \(k\) units.
+Per-token cost is $d(F+c+k)$ instead of $3dF$; at `c = 5,120`, `k = 2,304` of `F = 7,680` that is
+65.6% of the dense FFN.
 
-The approximate per-token cost becomes:
-
-\[
-d(F+c+k)
-\quad\text{instead of}\quad
-3dF
-\]
-
-Selection is exact, with a fixed number of selected units per token. CUDA and Metal use a four-pass radix selection on the floating-point bit representation. Threshold-based pruning was avoided because it cannot guarantee a fixed per-token count and pruned considerably less than expected in testing.
+Selection is exact, never a threshold: a four-pass radix select over the floating-point bit pattern on
+CUDA and Metal. Thresholds cannot hold a per-token count and were measured to prune far less than they
+claim.
 
 ### Vocabulary cut
 
-The vocabulary head and tied embedding are trimmed at load time from the
-![llama.cpp](https://raw.githubusercontent.com/ggml-org/llama-brand/refs/heads/master/logo/svg/cover/llama-cpp/cover-llama-cpp-dark.svg)
+The tied input embedding and output head are trimmed at load time to a calibration-derived id set —
+65,536 of 128,000 ids, so the head costs 52.4% of the original. `CASCADE_EXPAND` scatters the trimmed
+logits back into the full vocabulary with a `-inf` sentinel, so sampling code is untouched. Dropped ids
+carry 0.41% of the stock model's probability mass on held-out text and the rebuilt tokenizer costs
+1.004x as many tokens for the same bytes.
 
-<div align="center">
+The cascade applies to single-token steps only (`T = 1`); prompt processing takes the dense path.
 
-<b>LLM inference in C/C++</b>
+## Tested / not tested
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Release](https://img.shields.io/github/v/release/ggml-org/llama.cpp?color=brightgreen)](https://github.com/ggml-org/llama.cpp/releases?q=tag:v1)
-[![Nightly](https://img.shields.io/github/v/release/ggml-org/llama.cpp?label=nightly&filter=b*&color=orange)](https://github.com/ggml-org/llama.cpp/releases?q=b)
-[![Server](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/server.yml?label=Server)](https://github.com/ggml-org/llama.cpp/actions/workflows/server.yml)
-[![Docker](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/docker.yml?label=Docker)](https://github.com/ggml-org/llama.cpp/actions/workflows/docker.yml)
-[![Winget](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/winget.yml?label=Winget)](https://github.com/ggml-org/llama.cpp/actions/workflows/winget.yml)
+- **Tested**: greedy-identity at `c = k = F` on CUDA, Metal and CPU; every kernel variant listed in
+  [docs/lfm3-cascade.md](docs/lfm3-cascade.md) (radix vs bisection, load widths, occupancy shapes,
+  slice counts, and a fused selection+gather+reduction that measured slower and was reverted);
+  per-dispatch cost, measured by repeating an idempotent selection.
+- **Not tested**: quality beyond perplexity on one corpus, downstream benchmarks, second seeds.
 
-[v1.0.0](https://huggingface.co/blog/ggml-org/llama-cpp-v1) / [ggml](https://github.com/ggml-org/ggml) / [ops](https://github.com/ggml-org/llama.cpp/blob/master/docs/ops.md) / [maintainer PRs](https://github.com/ggml-org/llama.cpp/pulls?q=is%3Apr%20is%3Aopen%20draft%3AFalse%20(author%3Asanmai%20OR%20author%3Argerganov%20OR%20author%3AKitaitiMakoto%20OR%20author%3Adanbev%20OR%20author%3Aaldehir%20OR%20author%3Amax-krasnyansky%20OR%20author%3ACISC%20OR%20author%3Aggerganov%20OR%20author%3Aam17an%20OR%20author%3Ajhen0409%20OR%20author%3Abartowski1182%20OR%20author%3Anikwen%20OR%20author%3Ahipudding%20OR%20author%3Aravi9%20OR%20author%3AServeurpersoCom%20OR%20author%3Athelittlefireman%20OR%20author%3Apwilkin%20OR%20author%3Areeselevine%20OR%20author%3Angxson%20OR%20author%3Ajeffbolznv%20OR%20author%3Amarty1885%20OR%20author%3A0cc4m%20OR%20author%3ATitaniumtown%20OR%20author%3Aangt%20OR%20author%3AIMbackK%20OR%20author%3Aarthw%20OR%20author%3AJohannesGaessler%20OR%20author%3AORippler%20OR%20author%3Aruixiang63%20OR%20author%3Axctan%20OR%20author%3AmasterFoad%20OR%20author%3Aallozaur%20OR%20author%3AAndreas-Krebbel%20OR%20author%3Ayomaytk%20OR%20author%3Aaendk%20OR%20author%3Awine99%20OR%20author%3Agaugarg-nv%20OR%20author%3Ataronaeo%20OR%20author%3Aforforever73%20OR%20author%3Achaxu01%20OR%20author%3Alhez%20OR%20author%3AAlekseiNikiforovIBM%20OR%20author%3Anetrunnereve%20OR%20author%3Afairydreaming%20OR%20author%3Aynankani)%20sort%3Aupdated-desc) / [dev stats](https://github.com/ggml-org/llama.cpp-dev) / [lib llama API](https://github.com/ggml-org/llama.cpp/issues/9289) / [llama-server REST API](https://github.com/ggml-org/llama.cpp/issues/9291)
+## Licence
 
-</div>
+The llama.cpp part is MIT, as upstream. Model weights produced with this fork are derivatives of
+[LiquidAI/LFM3-1.7B](https://huggingface.co/LiquidAI/LFM3-1.7B) and carry that model's licence, not
+MIT.
 
-## Description
-
-The main goal of `llama.cpp` is to enable LLM (and MLLM) inference with minimal setup and state-of-the-art performance on a wide range of hardware - locally and in the cloud.
-
-The `llama.cpp` project is built on top of the [ggml](https://github.com/ggml-org/ggml) library.
-
-## Quick start
-
-A few options to get `llama.cpp` installed on your machine:
-
-```bash
-# curl
-curl -LsSf https://llama.app/install.sh | sh
-
-# powershell
-irm https://llama.app/install.ps1 | iex
-```
-
-- Visit https://llama.app and follow the instructions
-- Run with Docker - see our [Docker documentation](docs/docker.md)
-- Download pre-built binaries from the [releases page](https://github.com/ggml-org/llama.cpp/releases)
-- Build from source by cloning this repository - check out [our build guide](docs/build.md)
-
-Once installed:
-
-```sh
-# Download and run a model directly from Hugging Face
-llama cli -hf ggml-org/Qwen3.5-0.8B-GGUF
-
-# Launch OpenAI-compatible API server
-llama serve -hf ggml-org/Qwen3.5-0.8B-GGUF
-```
-
-<table align="center">
-    <tr>
-        <td align="center" width=50%>
-            <img width="1310" height="888" alt="VLM session with `llama cli`" src="https://github.com/user-attachments/assets/88726b48-1713-48aa-a525-95a02e78afc4" />
-            <i>VLM session with <b>llama cli</b></i>
-        </td>
-        <td align="center">
-            <img width="1392" height="958" alt="Llama Chat, the built-in chat app, against `llama serve` running Qwen 3.6" src="https://github.com/user-attachments/assets/b402f972-2e32-4def-8771-8d849f08cf2e" />
-            <i>Llama Chat, the built-in chat app, against <b>llama serve</b></i>
-        </td>
-    </tr>
-<table>
-
-## Documentation
-
-#### Tools
-
-- [cli](tools/cli/README.md)
-- [completion](tools/completion/README.md)
-- [server](tools/server/README.md)
-- [Text-to-speech (TTS) models](docs/multimodal/tts.md)
-- [GBNF grammars](grammars/README.md)
-
-#### Development
-
-- [How to build](docs/build.md)
-- [Running on Docker](docs/docker.md)
-- [Build on Android](docs/android.md)
-- [Multi-GPU usage](docs/multi-gpu.md)
-- [Performance troubleshooting](docs/development/token_generation_performance_tips.md)
-- [GGML tips & tricks](https://github.com/ggml-org/llama.cpp/wiki/GGML-Tips-&-Tricks)
-- [XCFramework](docs/xcframework.md)
-- [Completions](docs/completions.md)
-- [Models](docs/models.md)
-- [Release process](docs/release.md)
-
-## Contributing
-
-- Contributors can open PRs
-- Collaborators will be invited based on contributions
-- Maintainers can push to branches in the `llama.cpp` repo and merge PRs into the `master` branch
-- Any help with managing issues, PRs and projects is very appreciated!
-- Read the [CONTRIBUTING.md](CONTRIBUTING.md) for more information
-
-## Acknowledgements
-
-- [yhirose/cpp-httplib](https://github.com/yhirose/cpp-httplib) - Single-header HTTP server, used by `llama-server` - MIT license
-- [nothings/stb](https://github.com/nothings/stb) - Single-header image format decoder, used by multimodal subsystem - Public domain
-- [nlohmann/json](https://github.com/nlohmann/json) - Single-header JSON library, used by various tools/examples - MIT License
-- [mackron/miniaudio](https://github.com/mackron/miniaudio) - Single-header audio format decoder, used by multimodal subsystem - Public domain
-- [sheredom/subprocess.h](https://github.com/sheredom/subprocess.h) - Single-header process launching solution for C and C++ - Public domain
+Per-backend internals, per-kernel budgets and every diagnostic knob:
+**[docs/lfm3-cascade.md](docs/lfm3-cascade.md)**.
